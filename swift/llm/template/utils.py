@@ -115,13 +115,39 @@ def align_image_inputs(input_ids: List[int], labels: List[int], new_input_ids,
 
 
 def _split_str_by_regex(text: str, regex_delimiters: List[str]) -> List[str]:
-    combined_pattern = '|'.join(f'({pattern})' for pattern in regex_delimiters)
-    parts = re.split(combined_pattern, text, flags=re.DOTALL)
-    parts = [part for part in parts if part is not None]
-    if parts[0] == '':
-        parts.pop(0)
-    else:
-        parts.insert(0, '')
+    """Split text by regex patterns, handling patterns with capture groups."""
+    combined_pattern = '|'.join(f'(?:{pattern})' for pattern in regex_delimiters)
+
+    # Use finditer to find all matches
+    matches = list(re.finditer(combined_pattern, text, flags=re.DOTALL))
+
+    if not matches:
+        return ['', text]
+
+    parts = []
+    last_end = 0
+
+    for match in matches:
+        # Add the text before this match (non-matched part)
+        parts.append(text[last_end:match.start()])
+        # Add the matched text
+        parts.append(match.group(0))
+        last_end = match.end()
+
+    # Add any remaining text after the last match
+    parts.append(text[last_end:])
+
+    # Ensure we start with a non-matched part (even if empty)
+    if not parts or parts[0] != '':
+        if parts and parts[0] == '':
+            pass  # Already starts with empty string
+        else:
+            parts.insert(0, '')
+
+    # Ensure even number of parts
+    if len(parts) % 2 != 0:
+        parts.append('')
+
     assert len(parts) % 2 == 0, f'result: {parts}'
     assert ''.join(parts) == text, f'split_result: {parts}, text: {text}'
     return parts
@@ -147,11 +173,35 @@ def split_str_parts_by(text: str, delimiters: List[str], regex_mode: bool = Fals
         parts = [part for part in parts if part]
         for part in parts:
             for delimiter, delimiter_origin in zip(delimiters, delimiters_origin):
-                if re.match(delimiter, part, re.DOTALL):
+                match = re.match(delimiter, part, re.DOTALL)
+                if match:
+                    # Check if the pattern has capture groups
+                    if match.groups():
+                        # Has capture groups: separate tags and content
+                        full_match = match.group(0)
+                        content = match.group(1)  # First capture group
+
+                        # Calculate tag positions
+                        content_start = match.start(1)
+                        content_end = match.end(1)
+                        start_tag = full_match[:content_start]
+                        end_tag = full_match[content_end:]
+
+                        res.append({
+                            'key': delimiter_origin,
+                            'content': part,
+                            'has_groups': True,
+                            'start_tag': start_tag,
+                            'inner_content': content,
+                            'end_tag': end_tag
+                        })
+                    else:
+                        # No capture groups: keep original behavior
+                        res.append({'key': delimiter_origin, 'content': part, 'has_groups': False})
                     break
             else:
                 delimiter_origin = ''
-            res.append({'key': delimiter_origin, 'content': part})
+                res.append({'key': delimiter_origin, 'content': part, 'has_groups': False})
     else:
         for key, content in zip(parts[::2], parts[1::2]):
             res.append({'key': key, 'content': content})

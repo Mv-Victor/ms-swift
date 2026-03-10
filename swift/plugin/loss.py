@@ -8,10 +8,11 @@ import torch
 import torch.nn.functional as F
 from accelerate.utils import gather_object
 from torch import nn
-from torch.nn import CrossEntropyLoss, MSELoss
+from torch.nn import CrossEntropyLoss, MSELoss, BCEWithLogitsLoss, MarginRankingLoss
 from transformers.utils import strtobool
 
-from swift.utils import get_last_valid_indices
+from typing import List, Dict, Optional
+import json
 
 
 def cross_entropy_loss_func(outputs, labels, num_items_in_batch=None, **kwargs):
@@ -319,17 +320,12 @@ def _parse_multi_negative_sentences(sentences, labels, hard_negatives=None):
 
 
 def infonce_loss(outputs, labels, loss_scale=None, num_items_in_batch=None, **kwargs) -> torch.Tensor:
-    temperature = float(os.environ.get('INFONCE_TEMPERATURE', '0.1'))  # temperature
+    temperature = float(os.environ.get('INFONCE_TEMPERATURE', '0.01'))  # temperature
     # calculate CE across the batch, meaning all samples will be negative except the matching positive
     use_batch = strtobool(os.environ.get('INFONCE_USE_BATCH', 'True'))
     hard_negatives = os.environ.get('INFONCE_HARD_NEGATIVES', None)  # how many negative prompts kept in one sample
     # mask out fake negatives
     infonce_mask_fake_negative = strtobool(os.environ.get('INFONCE_MASK_FAKE_NEGATIVE', 'False'))
-    fake_neg_margin = float(os.environ.get('INFONCE_FAKE_NEG_MARGIN', '0.1'))
-    # enhanced components to align with Qwen3-Embedding denominator; controlled individually
-    # defaults set to False for backward compatibility
-    infonce_include_qq = strtobool(os.environ.get('INFONCE_INCLUDE_QQ', 'False'))
-    infonce_include_dd = strtobool(os.environ.get('INFONCE_INCLUDE_DD', 'False'))
     if hard_negatives is not None:
         hard_negatives = int(hard_negatives)
     from swift.utils import get_dist_setting
@@ -383,124 +379,43 @@ def infonce_loss(outputs, labels, loss_scale=None, num_items_in_batch=None, **kw
             # avg between all batches in one gpu
             loss /= len(split_tensors)
     else:
+
+        def mask_fake_negative(sim_matrix, sim_labels):
+            thresholds = sim_matrix[torch.arange(sim_matrix.size(0)), sim_labels].view(-1, 1) + 0.1
+            thresholds = thresholds.detach()
+            mask = sim_matrix > thresholds
+            sim_matrix[mask] = float('-inf')
+
         if can_batched:
             # [B, neg+2, D]
             sentences = torch.stack(split_tensors, dim=0)
-            # base q->d similarities (includes own positive and all in-batch documents)
-            queries = sentences[:, 0].squeeze(1)  # [B, D]
-            docs_all = sentences[:, 1:].reshape(-1, sentences.size(2))  # [B*(neg+1), D]
-            qd_matrix = torch.matmul(queries, docs_all.T)  # [B, B*(neg+1)]
-            # target indices: start of each group's document block (its positive)
+            # [B, D] * [B*(neg+1), D]
+            similarity_matrix = torch.matmul(sentences[:, 0].squeeze(1), sentences[:,
+                                                                                   1:].reshape(-1, sentences.size(2)).T)
             labels = torch.tensor(range(0,
                                         sentences.size(0) * (sentences.size(1) - 1),
                                         sentences.size(1) - 1)).view(-1).to(sentences.device)
-
-            logits_list = [qd_matrix]
-
-            if infonce_include_qq:
-                # q->q similarities; exclude self via -inf on diagonal to avoid accidental positives
-                qq_matrix = torch.matmul(queries, queries.T)  # [B, B]
-                qq_matrix = qq_matrix.clone()
-                qq_matrix.fill_diagonal_(float('-inf'))
-                logits_list.append(qq_matrix)
-
-            if infonce_include_dd:
-                # d+ -> d (doc-doc) similarities; exclude self-positive column per row
-                pos_docs = sentences[:, 1].squeeze(1)  # [B, D]
-                dd_matrix = torch.matmul(pos_docs, docs_all.T)  # [B, B*(neg+1)]
-                # mask self positive per row: column index = row_idx * (neg+1)
-                block = sentences.size(1) - 1  # (neg+1)
-                if block > 0:
-                    row_idx = torch.arange(dd_matrix.size(0), device=dd_matrix.device)
-                    col_idx = row_idx * block
-                    dd_matrix[row_idx, col_idx] = float('-inf')
-                logits_list.append(dd_matrix)
-
             if infonce_mask_fake_negative:
-                # thresholds derived from positive q->d scores per row
-                row_idx = torch.arange(qd_matrix.size(0), device=qd_matrix.device)
-                pos_scores = qd_matrix[row_idx, labels]
-                thresholds = pos_scores.view(-1, 1).detach() + fake_neg_margin
-
-                # qd block mask
-                qd_block = qd_matrix.clone()
-                qd_mask = qd_block > thresholds
-                qd_block[qd_mask] = float('-inf')
-
-                components = [qd_block]
-
-                # qq block mask (if present)
-                if infonce_include_qq:
-                    qq_block = qq_matrix.clone()
-                    qq_mask = qq_block > thresholds
-                    qq_block[qq_mask] = float('-inf')
-                    # diagonal already masked unconditionally at construction time
-                    components.append(qq_block)
-
-                # dd block (if present): self-positive column already masked unconditionally
-                if infonce_include_dd:
-                    # align with Qwen3-Embedding, no threshold masking for d-d
-                    components.append(dd_matrix)
-
-                similarity_matrix = torch.cat(components, dim=1)
-            else:
-                # concatenate all components without masking
-                similarity_matrix = torch.cat(logits_list, dim=1)
-            # temperature scaling and CE
+                mask_fake_negative(similarity_matrix, labels)
             similarity_matrix = similarity_matrix / temperature
-            loss = nn.CrossEntropyLoss()(similarity_matrix, labels)
+            # every neg+1 is positive start from 0
+            loss = nn.CrossEntropyLoss()(similarity_matrix, labels) / world_size  # avoid duplicate
         else:
             all_tensors = []
             for tensor in split_tensors:
                 all_tensors.append(tensor[1:])
             # cat all neg+1 tensors
             sentences = torch.cat(all_tensors, dim=0)
-            # prepare query anchors list if q-q is included
-            if infonce_include_qq:
-                queries_all = torch.stack([t[0] for t in split_tensors], dim=0)  # [B, D]
             length = 0
             for idx, tensor in enumerate(split_tensors):
                 # [D] * [B*(neg+1), D], neg numbers are different
-                qd_vec = torch.matmul(tensor[0], sentences.T)
-                target = torch.tensor(length).to(tensor.device)
-                logits_parts = []
-
-                # compute threshold from positive q->d score
-                threshold = (qd_vec[target].detach() + fake_neg_margin)
-
-                # qd part with masking
-                if infonce_mask_fake_negative:
-                    qd_masked = torch.where(qd_vec > threshold, torch.tensor(float('-inf'), device=qd_vec.device),
-                                            qd_vec)
-                else:
-                    qd_masked = qd_vec
-                logits_parts.append(qd_masked)
-
-                # qq part
-                if infonce_include_qq:
-                    qq_vec = torch.matmul(tensor[0], queries_all.T)  # [B]
-                    # exclude self
-                    qq_vec = qq_vec.clone()
-                    qq_vec[idx] = float('-inf')
-                    if infonce_mask_fake_negative:
-                        qq_vec = torch.where(qq_vec > threshold, torch.tensor(float('-inf'), device=qq_vec.device),
-                                             qq_vec)
-                    logits_parts.append(qq_vec)
-
-                # dd part
-                if infonce_include_dd:
-                    dd_vec = torch.matmul(tensor[1], sentences.T)  # [B*(neg+1)]
-                    # mask self positive column for this row only (no threshold masking for d-d)
-                    block = split_tensors[idx].size(0) - 1  # (neg+1) for this group
-                    dd_vec[length] = float('-inf')
-                    logits_parts.append(dd_vec)
-
-                logits_row = torch.cat(logits_parts, dim=-1)
-                logits_row = logits_row / temperature
-                loss += nn.CrossEntropyLoss()(logits_row.unsqueeze(0), target.unsqueeze(0))
+                similarity_matrix = torch.matmul(tensor[0], sentences.T) / temperature
+                labels = torch.tensor(length).to(tensor.device)
+                loss += nn.CrossEntropyLoss()(similarity_matrix, labels)
                 # next positive is neg+1
                 length += tensor.size(0) - 1
             loss /= len(split_tensors)
+            loss /= world_size  # avoid duplicate
     return loss
 
 
@@ -536,7 +451,6 @@ def generative_reranker_loss(outputs,
                              loss_scale=None,
                              num_items_in_batch=None,
                              trainer=None,
-                             attention_mask=None,
                              **kwargs) -> torch.Tensor:
     """
     Generative reranker loss function.
@@ -573,14 +487,10 @@ def generative_reranker_loss(outputs,
         raise ValueError(f"Failed to convert tokens '{positive_token}'/'{negative_token}' to IDs. "
                          f'Please check if these tokens exist in the tokenizer vocabulary. Error: {e}')
 
-    # Extract logits at the last valid (non-padding) token position for each sample
-    batch_size = logits.shape[0]
-    last_valid_indices = get_last_valid_indices(attention_mask)
-    batch_indices = torch.arange(batch_size, device=logits.device)
-    last_valid_logits = logits[batch_indices, last_valid_indices, :]
-
-    positive_logits = last_valid_logits[:, positive_token_id]  # [batch_size]
-    negative_logits = last_valid_logits[:, negative_token_id]  # [batch_size]
+    # Extract logits for positive and negative tokens directly from last position
+    # This avoids creating the large intermediate tensor last_logits
+    positive_logits = logits[:, -1, positive_token_id]  # [batch_size]
+    negative_logits = logits[:, -1, negative_token_id]  # [batch_size]
 
     # Stack to create binary classification logits
     # Shape: [batch_size, 2] where dim=1 represents [negative, positive]
@@ -690,7 +600,6 @@ def listwise_generative_reranker_loss(outputs,
                                       loss_scale=None,
                                       num_items_in_batch=None,
                                       trainer=None,
-                                      attention_mask=None,
                                       **kwargs) -> torch.Tensor:
     """
     List-wise generative reranker loss function.
@@ -741,16 +650,17 @@ def listwise_generative_reranker_loss(outputs,
         raise ValueError(f"Failed to convert tokens '{positive_token}'/'{negative_token}' to IDs. "
                          f'Please check if these tokens exist in the tokenizer vocabulary. Error: {e}')
 
-    # Extract logits at the last valid (non-padding) token position for each sample
-    batch_size = logits.shape[0]
-    last_valid_indices = get_last_valid_indices(attention_mask)
-    batch_indices = torch.arange(batch_size, device=logits.device)
-    last_valid_logits = logits[batch_indices, last_valid_indices, :]
+    # Extract logits for positive and negative tokens from last position
+    positive_logits = logits[:, -1, positive_token_id]  # [batch_size]
+    negative_logits = logits[:, -1, negative_token_id]  # [batch_size]
 
-    positive_logits = last_valid_logits[:, positive_token_id]  # [batch_size]
-    negative_logits = last_valid_logits[:, negative_token_id]  # [batch_size]
+    # Create binary classification logits for each sample
+    # Shape: [batch_size, 2] where dim=1 represents [negative, positive]
+    binary_logits = torch.stack([negative_logits, positive_logits], dim=1)
 
-    logits = F.logsigmoid(positive_logits - negative_logits)
+    # Convert to relevance scores using softmax (probability of positive class)
+    binary_probs = torch.softmax(binary_logits, dim=1)
+    relevance_scores = binary_probs[:, 1]  # Probability of positive class [batch_size]
 
     # Find positive sample indices to determine group boundaries
     positive_indices = torch.nonzero(labels == 1, as_tuple=False).squeeze(-1)
@@ -777,7 +687,7 @@ def listwise_generative_reranker_loss(outputs,
             group_end = len(labels)
 
         # Extract group relevance scores and labels
-        group_scores = logits[group_start:group_end]  # [group_size]
+        group_scores = relevance_scores[group_start:group_end]  # [group_size]
         group_labels = labels[group_start:group_end]  # [group_size]
 
         # Skip groups that are too small
@@ -788,7 +698,9 @@ def listwise_generative_reranker_loss(outputs,
         if group_labels[0] != 1:
             continue  # Skip malformed groups
 
-        group_logits = group_scores / temperature
+        # Convert relevance scores to logits for cross-entropy loss
+        # We use log to convert probabilities back to logits, then apply temperature
+        group_logits = torch.log(group_scores + 1e-8) / temperature  # Add small epsilon for numerical stability
 
         # The positive document is always at index 0 within the group
         target = torch.tensor(0, dtype=torch.long, device=logits.device)
@@ -807,6 +719,2009 @@ def listwise_generative_reranker_loss(outputs,
     return total_loss / num_groups
 
 
+###################
+def seqcls_plus_listwise_rank_loss(outputs,
+                                   labels,
+                                   loss_scale=None,
+                                   num_items_in_batch=None,
+                                   **kwargs) -> torch.Tensor:
+    """
+    Mixed: seq-cls CE + list-wise (positive-first) + adjacent monotonic regularizer (+ optional pairwise hinge).
+
+    分组：
+      - 每个组以 label=1 开头，直到下一个 label=1 之前的样本属于同组（数据需已按“折扣从高到低”排好）。
+
+    环境变量：
+      MIXED_CE_WEIGHT            默认 0.8
+      MIXED_RANK_WEIGHT          默认 0.15
+      MIXED_MONO_WEIGHT          默认 0.05
+      MIXED_PAIRWISE_WEIGHT      默认 0.0   # >0 开启组内 pairwise hinge
+      MIXED_TEMPERATURE          默认 1.0
+      MIXED_MIN_GROUP_SIZE       默认 2
+      MIXED_EXPECT_GROUP_SIZE    默认 0     # >0 时与 STRICT_GROUPING 配合
+      MIXED_STRICT_GROUPING      默认 True  # True: 仅等长组；False: 允许 >= MIN_GROUP_SIZE
+      MIXED_POSITIVE_CLASS_INDEX 默认 1
+      MIXED_MONO_MARGIN          默认 0.0   # 相邻单调 margin
+      MIXED_PAIRWISE_MARGIN      默认 0.2   # pairwise hinge margin
+      MIXED_GROUP_WEIGHTING      默认 'none'  # 'none' | 'len' | 'neg'
+    """
+    logits = outputs.logits
+    device = logits.device
+    y = labels
+
+    # ---- 超参 ----
+    ce_w   = float(os.environ.get('MIXED_CE_WEIGHT',   '0.60'))
+    rk_w   = float(os.environ.get('MIXED_RANK_WEIGHT', '0.25'))
+    mono_w = float(os.environ.get('MIXED_MONO_WEIGHT', '0.10'))
+    pair_w = float(os.environ.get('MIXED_PAIRWISE_WEIGHT', '0.05'))
+
+    temperature    = float(os.environ.get('MIXED_TEMPERATURE', '0.7'))
+    min_group_size = int(os.environ.get('MIXED_MIN_GROUP_SIZE', '2'))
+    expect_size    = int(os.environ.get('MIXED_EXPECT_GROUP_SIZE', '4'))
+    strict_group   = os.environ.get('MIXED_STRICT_GROUPING', 'True').lower() != 'false'
+    pos_class_idx  = int(os.environ.get('MIXED_POSITIVE_CLASS_INDEX', '1'))
+    mono_margin    = float(os.environ.get('MIXED_MONO_MARGIN', '0.1'))
+    pair_margin    = float(os.environ.get('MIXED_PAIRWISE_MARGIN', '0.3'))
+    group_weighting = os.environ.get('MIXED_GROUP_WEIGHTING', 'none').lower()
+
+    eps = 1e-6
+
+    # ---- 分类损失 L_ce & 排序分数 s ----
+    if logits.dim() == 2 and logits.size(-1) >= 2:
+        ce_loss = CrossEntropyLoss()(logits, y.long().to(device))
+        s = logits[:, pos_class_idx]   # 正类 logit 作为排序分数
+    else:
+        # [B] or [B,1]
+        logits_bce = logits.squeeze(-1) if (logits.dim()==2 and logits.size(-1)==1) else logits
+        ce_loss = nn.BCEWithLogitsLoss()(logits_bce, y.float().to(device))
+        s = logits_bce
+
+    # ---- 根据 label==1 找到每个组 ----
+    yf = y.float()
+    pos_idx = torch.nonzero(yf == 1, as_tuple=False).squeeze(-1)
+    if pos_idx.numel() == 0:
+        return ce_w * ce_loss
+    if pos_idx.dim() == 0:
+        pos_idx = pos_idx.unsqueeze(0)
+
+    total_rank = torch.tensor(0.0, device=device)
+    total_mono = torch.tensor(0.0, device=device)
+    total_pair = torch.tensor(0.0, device=device)
+    rank_wsum = mono_wsum = pair_wsum = 0.0  # 用于按组加权的归一
+
+    for i, st in enumerate(pos_idx):
+        st = st.item()
+        ed = pos_idx[i+1].item() if (i+1) < len(pos_idx) else yf.numel()
+
+        gs = s[st:ed]      # [G]
+        gl = yf[st:ed]     # [G]
+        G = gs.numel()
+
+        # 组合法校验
+        if G < max(2, min_group_size):
+            continue
+        if gl[0] != 1:
+            continue
+        if expect_size > 0:
+            if strict_group and (G != expect_size):
+                continue
+            if (not strict_group) and (G < expect_size):
+                continue
+
+        # 组权重（可选）：none | len(=G) | neg(=G-1)
+        if group_weighting == 'len':
+            gw = float(G)
+        elif group_weighting == 'neg':
+            gw = float(max(1, G-1))
+        else:
+            gw = 1.0
+
+        # ---- listwise 排序（正样本应排第一）----
+        scaled = gs / max(temperature, eps)             # [G]
+        # CrossEntropyLoss 期望 [N,C]，我们把一组当 batch=1，C=G
+        group_rank = CrossEntropyLoss()(scaled.unsqueeze(0),
+                                        torch.tensor([0], device=device))
+        total_rank = total_rank + gw * group_rank
+        rank_wsum += gw
+
+        # ---- 相邻单调约束（s[0] ≥ s[1] ≥ ...）----
+        if G >= 2 and mono_w > 0:
+            diffs = gs[:-1] - gs[1:]                    # [G-1]
+            viola = torch.relu(mono_margin - diffs)     # 违反单调的“缺口”
+            mono_loss = viola.mean()
+            total_mono = total_mono + gw * mono_loss
+            mono_wsum += gw
+
+        # ---- 组内 pairwise hinge（可选）: s_pos - s_neg ≥ pair_margin ----
+        if pair_w > 0 and G >= 2:
+            s_pos = gs[0]
+            s_negs = gs[1:]
+            hinge = torch.relu(pair_margin - (s_pos - s_negs))  # [G-1]
+            pair_loss = hinge.mean()
+            total_pair = total_pair + gw * pair_loss
+            pair_wsum += gw
+
+    rank_loss = total_rank / max(rank_wsum, 1.0) if rank_wsum > 0 else torch.tensor(0.0, device=device)
+    mono_loss = total_mono / max(mono_wsum, 1.0) if mono_wsum > 0 else torch.tensor(0.0, device=device)
+    opt_pair  = total_pair / max(pair_wsum, 1.0) if pair_wsum > 0 else torch.tensor(0.0, device=device)
+
+    return ce_w * ce_loss + rk_w * rank_loss + mono_w * mono_loss + pair_w * opt_pair
+
+def seqcls_plus_pairwise_rank_loss(outputs, labels, **kwargs):
+    """
+    CE + Pairwise(组内) + Monotone(相邻)
+    分组：label==1 为起点到下一个 1 之前为一组；生成数据应已按折扣从高到低排序。
+    环境变量：
+      MIXED_CE_WEIGHT, MIXED_PAIR_WEIGHT, MIXED_MONO_WEIGHT
+      MIXED_TEMPERATURE (pairwise温度, 默认0.5~1)
+      MIXED_MIN_GROUP_SIZE (默认2)
+      MIXED_EXPECT_GROUP_SIZE (0不强制；>0时仅长度==该值的组计算排序/单调)
+      MIXED_POSITIVE_CLASS_INDEX (多分类正类下标，默认1)
+      MIXED_MONO_MARGIN (相邻单调边距 τ, 默认0.0~0.2)
+      PAIR_INCLUDE_NEGNEG (是否对负例内部也做 pairwise，默认1)
+      PAIR_MARGIN (pairwise hinge 边距，默认0，用 logistic 就忽略)
+      PAIR_LOSS (logistic|hinge, 默认 logistic)
+    """
+    logits = outputs.logits
+    device = logits.device
+    y = labels
+
+    # weights & hparams
+    ce_w = float(os.environ.get('MIXED_CE_WEIGHT', '0.5'))
+    pr_w = float(os.environ.get('MIXED_PAIR_WEIGHT', '0.4'))
+    mono_w = float(os.environ.get('MIXED_MONO_WEIGHT', '0.1'))
+    T = float(os.environ.get('MIXED_TEMPERATURE', '0.6'))
+    minG = int(os.environ.get('MIXED_MIN_GROUP_SIZE', '2'))
+    expG = int(os.environ.get('MIXED_EXPECT_GROUP_SIZE', '0'))
+    pos_ix = int(os.environ.get('MIXED_POSITIVE_CLASS_INDEX', '1'))
+    mono_m = float(os.environ.get('MIXED_MONO_MARGIN', '0.1'))
+    negneg = os.environ.get('PAIR_INCLUDE_NEGNEG', '1') == '1'
+    pair_margin = float(os.environ.get('PAIR_MARGIN', '0.3'))
+    pair_mode = os.environ.get('PAIR_LOSS', 'logistic').lower()  # 'logistic' or 'hinge'
+
+    # ce_w   = float(os.environ.get('MIXED_CE_WEIGHT',   '0.3'))
+    # pr_w   = float(os.environ.get('MIXED_PAIR_WEIGHT', '0.6'))
+    # mono_w = float(os.environ.get('MIXED_MONO_WEIGHT', '0.1'))
+    # T      = float(os.environ.get('MIXED_TEMPERATURE', '0.55'))
+    # minG   = int(os.environ.get('MIXED_MIN_GROUP_SIZE','2'))
+    # expG   = int(os.environ.get('MIXED_EXPECT_GROUP_SIZE','0'))
+    # pos_ix = int(os.environ.get('MIXED_POSITIVE_CLASS_INDEX','1'))
+    # mono_m = float(os.environ.get('MIXED_MONO_MARGIN','0.12'))
+    # negneg = os.environ.get('PAIR_INCLUDE_NEGNEG','1') == '1'
+    # pair_margin = float(os.environ.get('PAIR_MARGIN','0.3'))
+    # pair_mode = os.environ.get('PAIR_LOSS','logistic').lower()  # 'logistic' or 'hinge'
+
+    # CE + 取排序分数 s
+    if logits.dim()==2 and logits.size(-1)>=2:
+        ce = CrossEntropyLoss()(logits, y.long().to(device))
+        s  = logits[:, pos_ix]
+    else:
+        z = logits.squeeze(-1) if (logits.dim()==2 and logits.size(-1)==1) else logits
+        ce = nn.BCEWithLogitsLoss()(z, y.float().to(device))
+        s  = z
+
+    # 分组
+    yf = y.float()
+    pos_idx = torch.nonzero(yf==1, as_tuple=False).squeeze(-1)
+    if pos_idx.numel()==0:
+        return ce_w*ce
+    if pos_idx.dim()==0:
+        pos_idx = pos_idx.unsqueeze(0)
+
+    # helpers
+    def pairwise_logistic(x):
+        # L = log(1 + exp(-(x)/T))
+        return torch.nn.functional.softplus(-(x)/max(T,1e-6))
+    def pairwise_hinge(x):
+        # L = relu(margin - x)
+        return torch.relu(pair_margin - x)
+
+    total_pair = torch.tensor(0.0, device=device)
+    total_mono = torch.tensor(0.0, device=device)
+    n_pairG = 0
+    n_monoG = 0
+
+    for i, st in enumerate(pos_idx.tolist()):
+        ed = pos_idx[i+1].item() if (i+1)<len(pos_idx) else yf.numel()
+        gs = s[st:ed]   # [G]
+        gl = yf[st:ed]  # [G]
+        G  = gs.numel()
+        if G < minG:
+            continue
+        if gl[0] != 1:
+            continue
+        if expG>0 and G != expG:
+            continue
+
+        # (1) pairwise：正对负
+        pos_score = gs[0]
+        neg_scores = gs[1:]
+        if neg_scores.numel()>0:
+            diff = pos_score - neg_scores  # 应 >= 0
+            loss_vec = pairwise_logistic(diff) if pair_mode=='logistic' else pairwise_hinge(diff)
+            total_pair = total_pair + loss_vec.mean()
+            n_pairG += 1
+
+        # (2) 负例内部也按顺序约束（高折扣 ≥ 低折扣）
+        if negneg and neg_scores.numel()>=2:
+            # 全对儿或只相邻都行，这里做“全对儿更强”；相邻可改为 diff = neg_scores[:-1]-neg_scores[1:]
+            diffs = []
+            for a in range(neg_scores.numel()-1):
+                for b in range(a+1, neg_scores.numel()):
+                    diffs.append(neg_scores[a] - neg_scores[b])  # 应 ≥ 0
+            diffs = torch.stack(diffs)
+            loss_vec2 = pairwise_logistic(diffs) if pair_mode=='logistic' else pairwise_hinge(diffs)
+            total_pair = total_pair + loss_vec2.mean()
+            # 不另计 n_pairG，维持尺度稳定
+
+        # (3) 相邻单调（与上一步相比更温和，可一起用）
+        if G >= 2:
+            dif = gs[:-1] - gs[1:]
+            mono = torch.relu(mono_m - dif).mean()
+            total_mono = total_mono + mono
+            n_monoG += 1
+
+    pair_loss = (total_pair / max(n_pairG,1)) if n_pairG>0 else torch.tensor(0.0, device=device)
+    mono_loss = (total_mono / max(n_monoG,1)) if n_monoG>0 else torch.tensor(0.0, device=device)
+
+    return ce_w*ce + pr_w*pair_loss + mono_w*mono_loss
+
+
+def seqcls_plus_pairwise_rank_loss_threshold(
+        outputs,
+        labels,
+        loss_scale: Optional[float] = None,
+        num_items_in_batch: Optional[int] = None,
+        **kwargs
+) -> torch.Tensor:
+    """
+    基于阈值分组的软标签Pairwise Ranking损失（Swift框架标准版本）
+
+    核心逻辑：
+    1. BCE使用所有样本的软标签（0-1之间的浮点数）
+    2. Pairwise分组：通过阈值判断"强正例"和"强负例"
+    3. 单调性约束：相邻discount的分数应递减
+    4. 自动权重推断：基于标签置信度（接近0或1的权重高）
+
+    参数：
+        outputs: 模型输出对象（包含logits属性）
+        labels: 软标签，tensor of shape [batch_size], 值在[0, 1]之间
+        loss_scale: 损失缩放因子（swift框架保留参数）
+        num_items_in_batch: batch中的有效样本数（swift框架保留参数）
+        **kwargs: 其他参数（swift框架可能传入的额外信息）
+
+    环境变量配置：
+        MIXED_CE_WEIGHT: BCE权重，默认0.5
+        MIXED_PAIR_WEIGHT: Pairwise权重，默认0.3
+        MIXED_MONO_WEIGHT: 单调性权重，默认0.2
+        MIXED_TEMPERATURE: Pairwise温度参数，默认0.6
+        MIXED_MONO_MARGIN: 单调性边距，默认0.1
+        MIXED_POS_THRESHOLD: 强正例阈值，默认0.7
+        MIXED_NEG_THRESHOLD: 强负例阈值，默认0.3
+        MIXED_MIN_GROUP_SIZE: 最小组大小，默认2
+        PAIR_INCLUDE_NEGNEG: 负例之间是否也做pairwise，默认1
+        PAIR_MIN_DIFF: Pairwise最小标签差异阈值，默认0.15
+        MIXED_AUTO_WEIGHT: 是否自动计算样本权重，默认1
+            - 0: 所有样本权重=1
+            - 1: 根据标签置信度计算（label接近0或1 → 权重高）
+        MIXED_WEIGHT_MIN: 自动权重的最小值，默认0.3
+        MIXED_WEIGHT_MAX: 自动权重的最大值，默认1.0
+
+    返回：
+        torch.Tensor: 标量损失值
+    """
+    # ========== 提取logits和labels ==========
+    logits = outputs.logits
+    device = logits.device
+    y = labels.float().to(device)  # 软标签
+
+    # ========== 超参数读取 ==========
+    ce_w = float(os.environ.get('MIXED_CE_WEIGHT', '0.5'))
+    pr_w = float(os.environ.get('MIXED_PAIR_WEIGHT', '0.3'))
+    mono_w = float(os.environ.get('MIXED_MONO_WEIGHT', '0.2'))
+    T = float(os.environ.get('MIXED_TEMPERATURE', '0.6'))
+    mono_margin = float(os.environ.get('MIXED_MONO_MARGIN', '0.1'))
+
+    # 阈值参数
+    pos_threshold = float(os.environ.get('MIXED_POS_THRESHOLD', '0.7'))
+    neg_threshold = float(os.environ.get('MIXED_NEG_THRESHOLD', '0.3'))
+    min_group_size = int(os.environ.get('MIXED_MIN_GROUP_SIZE', '2'))
+    negneg = os.environ.get('PAIR_INCLUDE_NEGNEG', '1') == '1'
+    min_diff = float(os.environ.get('PAIR_MIN_DIFF', '0.15'))
+
+    # 权重参数
+    auto_weight = os.environ.get('MIXED_AUTO_WEIGHT', '1') == '1'
+    weight_min = float(os.environ.get('MIXED_WEIGHT_MIN', '0.3'))
+    weight_max = float(os.environ.get('MIXED_WEIGHT_MAX', '1.0'))
+
+    # ========== 自动权重计算 ==========
+    if auto_weight:
+        # 基于标签置信度计算权重
+        # label接近0或1（确定性高） → 权重高
+        # label接近0.5（不确定性高） → 权重低
+
+        # 计算距离0.5的距离（归一化到[0,1]）
+        confidence = torch.abs(y - 0.5) * 2  # [0, 1]范围
+
+        # 映射到[weight_min, weight_max]
+        weights = weight_min + (weight_max - weight_min) * confidence
+
+        # 示例：
+        # label=1.0 → confidence=1.0 → weight=1.0
+        # label=0.0 → confidence=1.0 → weight=1.0
+        # label=0.85 → confidence=0.7 → weight=0.3+0.7*0.7=0.79
+        # label=0.50 → confidence=0.0 → weight=0.3
+    else:
+        # 所有样本权重相同
+        weights = torch.ones_like(y)
+
+    # ========== 1. 加权BCE损失（支持软标签）==========
+    if logits.dim() == 2 and logits.size(-1) >= 2:
+        # 多分类情况
+        pos_class_idx = int(os.environ.get('MIXED_POSITIVE_CLASS_INDEX', '1'))
+        s = logits[:, pos_class_idx]  # 排序分数
+
+        # 计算概率
+        probs = torch.softmax(logits, dim=-1)[:, pos_class_idx]
+
+        # BCE loss
+        ce = F.binary_cross_entropy(probs, y, reduction='none')
+
+    else:
+        # 单输出情况
+        z = logits.squeeze(-1) if (logits.dim() == 2 and logits.size(-1) == 1) else logits
+        s = z  # logits作为排序分数
+
+        # BCE with logits
+        ce = F.binary_cross_entropy_with_logits(z, y, reduction='none')
+
+    # 加权平均
+    ce_weighted = (ce * weights).sum()
+
+    # 归一化
+    if num_items_in_batch is not None and num_items_in_batch > 0:
+        ce_loss = ce_weighted / num_items_in_batch
+    else:
+        ce_loss = ce_weighted / max(weights.sum(), 1e-6)
+
+    # ========== 2. 基于阈值的Pairwise损失 ==========
+    strong_pos_mask = y >= pos_threshold
+    strong_pos_idx = torch.nonzero(strong_pos_mask, as_tuple=False).squeeze(-1)
+
+    if strong_pos_idx.numel() == 0:
+        pair_loss = torch.tensor(0.0, device=device)
+    else:
+        if strong_pos_idx.dim() == 0:
+            strong_pos_idx = strong_pos_idx.unsqueeze(0)
+
+        total_pair = torch.tensor(0.0, device=device)
+        pair_count = 0
+
+        for i, st in enumerate(strong_pos_idx.tolist()):
+            ed = strong_pos_idx[i + 1].item() if (i + 1) < len(strong_pos_idx) else y.numel()
+
+            gs = s[st:ed]
+            gy = y[st:ed]
+            gw = weights[st:ed]
+
+            G = gs.numel()
+
+            if G < min_group_size:
+                continue
+
+            if gy[0] < pos_threshold:
+                continue
+
+            # === Pairwise: anchor vs 其他样本 ===
+            pos_score = gs[0]
+            pos_label = gy[0]
+
+            for j in range(1, G):
+                other_score = gs[j]
+                other_label = gy[j]
+                other_weight = gw[j]
+
+                y_diff = pos_label - other_label
+
+                if y_diff > min_diff:
+                    score_diff = pos_score - other_score
+                    loss_pair = F.softplus(-score_diff / max(T, 1e-6))
+
+                    # 权重 = 标签差异 × 样本权重
+                    weight_pair = y_diff * other_weight
+
+                    total_pair += loss_pair * weight_pair
+                    pair_count += 1
+
+            # === 负例之间的pairwise ===
+            if negneg and G >= 3:
+                neg_indices = [j for j in range(1, G) if gy[j] <= neg_threshold]
+
+                for idx1 in range(len(neg_indices) - 1):
+                    for idx2 in range(idx1 + 1, len(neg_indices)):
+                        j1 = neg_indices[idx1]
+                        j2 = neg_indices[idx2]
+
+                        y_diff_neg = gy[j1] - gy[j2]
+
+                        if abs(y_diff_neg) > 0.1:
+                            score_diff_neg = gs[j1] - gs[j2]
+
+                            if y_diff_neg > 0:
+                                loss_neg = F.softplus(-score_diff_neg / max(T, 1e-6))
+                            else:
+                                loss_neg = F.softplus(score_diff_neg / max(T, 1e-6))
+
+                            weight_neg = abs(y_diff_neg) * (gw[j1] + gw[j2]) / 2 * 0.5
+
+                            total_pair += loss_neg * weight_neg
+                            pair_count += 1
+
+        pair_loss = total_pair / max(pair_count, 1) if pair_count > 0 else torch.tensor(0.0, device=device)
+
+    # ========== 3. 单调性约束 ==========
+    total_mono = torch.tensor(0.0, device=device)
+    mono_count = 0
+
+    if strong_pos_idx.numel() > 0:
+        for i, st in enumerate(strong_pos_idx.tolist()):
+            ed = strong_pos_idx[i + 1].item() if (i + 1) < len(strong_pos_idx) else y.numel()
+
+            gs = s[st:ed]
+            gw = weights[st:ed]
+            G = gs.numel()
+
+            if G >= 2:
+                diffs = gs[:-1] - gs[1:]
+                mono_violations = torch.relu(mono_margin - diffs)
+
+                # 使用相邻样本的平均权重
+                pair_weights = (gw[:-1] + gw[1:]) / 2
+
+                total_mono += (mono_violations * pair_weights).sum()
+                mono_count += len(diffs)
+
+    mono_loss = total_mono / max(mono_count, 1) if mono_count > 0 else torch.tensor(0.0, device=device)
+
+    # ========== 4. 组合损失 ==========
+    total_loss = ce_w * ce_loss + pr_w * pair_loss + mono_w * mono_loss
+
+    # 如果提供了loss_scale，应用缩放
+    if loss_scale is not None and loss_scale != 1.0:
+        total_loss = total_loss * loss_scale
+
+    return total_loss
+
+
+###################
+def pricing_pairwise_loss(outputs, labels, loss_scale=None, num_items_in_batch=None, **kwargs) -> torch.Tensor:
+    """
+    营销定价损失函数：50% CE + 50% Pairwise
+
+    数据格式要求：
+    - 相邻两条样本形成正负对，具有相同的用户画像但不同的discount
+    - batch_size必须是偶数
+    - 样本组织（由数据合成脚本生成）：
+      * 偶数索引（0,2,4...）：discount较大的样本（相对"正"）
+      * 奇数索引（1,3,5...）：discount较小的样本（相对"负"）
+
+    损失计算：
+    1. CE Loss (50%): 标准的二分类交叉熵，使用真实label
+    2. Pairwise Loss (50%): 确保discount大的样本得分高于discount小的样本
+
+    环境变量配置：
+    - PRICING_PAIRWISE_MARGIN: Pairwise loss的margin (默认0.5)
+    - PRICING_CE_WEIGHT: CE loss的权重 (默认0.5)
+    - PRICING_PAIRWISE_WEIGHT: Pairwise loss的权重 (默认0.5)
+    """
+    logits = outputs.logits  # 可能是 [batch_size] 或 [batch_size, num_classes]
+
+    # 处理不同的logits形状
+    if len(logits.shape) == 1:
+        # 形状是 [batch_size]，二分类单输出
+        logits = logits
+        use_bce = True
+    elif len(logits.shape) == 2:
+        if logits.shape[1] == 1:
+            # 形状是 [batch_size, 1]，需要squeeze
+            logits = logits.squeeze(-1)
+            use_bce = True
+        elif logits.shape[1] == 2:
+            # 形状是 [batch_size, 2]，二分类双输出
+            # 对于Pairwise，我们使用正类（class 1）的logit
+            use_bce = False
+        else:
+            raise ValueError(f"Unexpected logits shape: {logits.shape}")
+    else:
+        raise ValueError(f"Unexpected logits shape: {logits.shape}")
+
+    labels = labels.long() if not use_bce else labels.float()
+    batch_size = logits.size(0)
+
+    # 确保batch_size是偶数
+    if batch_size % 2 != 0:
+        raise ValueError(
+            f"Batch size must be even for pairwise loss, got {batch_size}. "
+            f"Please set batch_size to an even number (e.g., 2, 4, 8, 16)."
+        )
+
+    # 从环境变量获取配置
+    margin = float(os.environ.get('PRICING_PAIRWISE_MARGIN', '0.5'))
+    ce_weight = float(os.environ.get('PRICING_CE_WEIGHT', '0.5'))
+    pairwise_weight = float(os.environ.get('PRICING_PAIRWISE_WEIGHT', '0.5'))
+
+    # 1. 计算交叉熵损失
+    if use_bce:
+        # 使用BCEWithLogitsLoss (logits是 [batch_size])
+        ce_loss_fct = BCEWithLogitsLoss()
+        ce_loss = ce_loss_fct(logits, labels)
+        # 用于pairwise的得分就是logits本身
+        scores = logits
+    else:
+        # 使用CrossEntropyLoss (logits是 [batch_size, 2])
+        ce_loss_fct = CrossEntropyLoss()
+        ce_loss = ce_loss_fct(logits, labels)
+        # 用于pairwise的得分是正类的logit（索引为1）
+        scores = logits[:, 1]
+
+    # 2. 计算Pairwise损失
+    # 数据组织：[discount大, discount小, discount大, discount小, ...]
+    # 索引：     [0,         1,         2,         3,         ...]
+
+    pos_indices = torch.arange(0, batch_size, 2, device=scores.device)  # [0, 2, 4, ...]
+    neg_indices = torch.arange(1, batch_size, 2, device=scores.device)  # [1, 3, 5, ...]
+
+    pos_scores = scores[pos_indices]  # discount较大的样本的得分
+    neg_scores = scores[neg_indices]  # discount较小的样本的得分
+
+    # 使用Margin Ranking Loss
+    # target=1 表示期望第一个输入 > 第二个输入（即pos_scores > neg_scores）
+    target = torch.ones_like(pos_scores)
+    pairwise_loss_fct = MarginRankingLoss(margin=margin)
+    pairwise_loss = pairwise_loss_fct(pos_scores, neg_scores, target)
+
+    # 3. 组合损失
+    total_loss = ce_weight * ce_loss + pairwise_weight * pairwise_loss
+
+    # 4. 记录额外信息（用于监控，不影响反向传播）
+    with torch.no_grad():
+        # 计算pairwise准确率
+        pairwise_correct = (pos_scores > neg_scores).float().mean()
+        avg_margin = (pos_scores - neg_scores).mean()
+
+        # 可以通过outputs存储额外信息供后续使用
+        if hasattr(outputs, 'loss_info'):
+            outputs.loss_info = {
+                'ce_loss': ce_loss.item(),
+                'pairwise_loss': pairwise_loss.item(),
+                'pairwise_accuracy': pairwise_correct.item(),
+                'avg_margin': avg_margin.item(),
+            }
+
+    return total_loss
+
+
+def pricing_listwise_loss_old(outputs, labels, loss_scale=None, num_items_in_batch=None, **kwargs) -> torch.Tensor:
+    """
+    营销定价Listwise损失函数（改进版）：CE + Listwise Ranking + Monotonic Constraint
+
+    三个目标：
+    1. CE Loss: 二分类准确性
+    2. Listwise Loss: 整体排序分布优化
+    3. Monotonic Loss: 显式单调性约束
+
+    环境变量：
+    - PRICING_CHAIN_LENGTH: 序列长度（默认8）
+    - PRICING_CE_WEIGHT: CE权重（默认0.2）
+    - PRICING_LISTWISE_WEIGHT: Listwise权重（默认0.5）
+    - PRICING_MONOTONIC_WEIGHT: 单调性权重（默认0.3）
+    - PRICING_LISTWISE_TEMP: Softmax温度（默认1.0）
+    - PRICING_MONOTONIC_MARGIN: 单调性margin（默认0.1）
+    """
+    logits = outputs.logits
+
+    # 处理logits形状
+    if len(logits.shape) == 2:
+        if logits.shape[1] == 1:
+            scores = logits.squeeze(-1)
+            use_bce = True
+        elif logits.shape[1] == 2:
+            scores = logits[:, 1]  # 正类的logit
+            use_bce = False
+        else:
+            raise ValueError(f"Unexpected logits shape: {logits.shape}")
+    else:
+        scores = logits
+        use_bce = True
+
+    labels_for_ce = labels.float() if use_bce else labels.long()
+
+    # 配置参数
+    chain_length = int(os.environ.get('PRICING_CHAIN_LENGTH', '8'))
+    ce_weight = float(os.environ.get('PRICING_CE_WEIGHT', '0.2'))
+    listwise_weight = float(os.environ.get('PRICING_LISTWISE_WEIGHT', '0.5'))
+    monotonic_weight = float(os.environ.get('PRICING_MONOTONIC_WEIGHT', '0.3'))
+    temperature = float(os.environ.get('PRICING_LISTWISE_TEMP', '1.0'))
+    margin = float(os.environ.get('PRICING_MONOTONIC_MARGIN', '0.1'))
+
+    batch_size = scores.size(0)
+
+    if batch_size % chain_length != 0:
+        raise ValueError(
+            f"Batch size ({batch_size}) must be divisible by chain_length ({chain_length}). "
+            f"Current batch_size={batch_size}, chain_length={chain_length}"
+        )
+
+    # 1. CE损失（标准分类loss）
+    if use_bce:
+        ce_loss = nn.BCEWithLogitsLoss()(
+            logits.squeeze(-1) if len(logits.shape) == 2 else logits,
+            labels_for_ce
+        )
+    else:
+        ce_loss = nn.CrossEntropyLoss()(logits, labels_for_ce)
+
+    # 重塑scores: [num_sequences, chain_length]
+    num_sequences = batch_size // chain_length
+    scores_reshaped = scores.view(num_sequences, chain_length)
+    labels_reshaped = labels.view(num_sequences, chain_length)
+
+    # 2. Listwise Ranking损失（改进版）
+    # 构建更aggressive的理想分布
+    # 使用指数增长而不是线性增长
+    ideal_scores = torch.arange(chain_length, dtype=scores.dtype, device=scores.device)
+    # 指数缩放：让后面位置的优势更明显
+    ideal_scores = torch.exp(ideal_scores * 0.5)  # 指数增长
+    ideal_scores = ideal_scores.unsqueeze(0).expand(num_sequences, -1)
+
+    # 计算softmax分布
+    pred_probs = torch.softmax(scores_reshaped / temperature, dim=1)
+    ideal_probs = torch.softmax(ideal_scores / temperature, dim=1)
+
+    # KL散度：pred尽量接近ideal
+    listwise_loss = nn.KLDivLoss(reduction='batchmean')(
+        torch.log(pred_probs + 1e-10),
+        ideal_probs
+    )
+
+    # 3. 显式单调性约束
+    # 确保 score[i+1] > score[i] + margin
+    # 计算相邻位置的得分差
+    score_diffs = scores_reshaped[:, 1:] - scores_reshaped[:, :-1]  # [num_seq, chain_length-1]
+
+    # Hinge loss: max(0, margin - diff)
+    # 如果 diff >= margin，loss=0；否则loss=margin-diff
+    monotonic_loss = torch.clamp(margin - score_diffs, min=0).mean()
+
+    # 4. 组合损失
+    total_loss = (
+            ce_weight * ce_loss +
+            listwise_weight * listwise_loss +
+            monotonic_weight * monotonic_loss
+    )
+
+    # 5. 记录监控指标（不影响梯度）
+    # with torch.no_grad():
+    #     # 单调性违反率：有多少相邻对不满足 score[i+1] > score[i]
+    #     monotonic_violations = (score_diffs <= 0).float().mean()
+    #
+    #     # 平均得分增量
+    #     avg_score_increment = score_diffs.mean()
+    #
+    #     # 首尾得分差
+    #     score_range = (scores_reshaped[:, -1] - scores_reshaped[:, 0]).mean()
+    #
+    #     # Kendall's tau相关系数（理想排序 vs 实际排序）
+    #     # 简化版：计算逆序对比例
+    #     n_pairs = chain_length * (chain_length - 1) / 2
+    #     inversions = 0
+    #     for i in range(chain_length):
+    #         for j in range(i + 1, chain_length):
+    #             inversions += (scores_reshaped[:, i] > scores_reshaped[:, j]).sum().item()
+    #     inversion_rate = inversions / (num_sequences * n_pairs)
+    #
+    #     # 存储到outputs（可选）
+    #     if hasattr(outputs, 'loss_info'):
+    #         outputs.loss_info = {
+    #             'ce_loss': ce_loss.item(),
+    #             'listwise_loss': listwise_loss.item(),
+    #             'monotonic_loss': monotonic_loss.item(),
+    #             'monotonic_violation_rate': monotonic_violations.item(),
+    #             'avg_score_increment': avg_score_increment.item(),
+    #             'score_range': score_range.item(),
+    #             'inversion_rate': inversion_rate,
+    #         }
+
+    return total_loss
+
+
+def pricing_listwise_loss(outputs, labels, loss_scale=None, num_items_in_batch=None, **kwargs) -> torch.Tensor:
+    """
+    营销定价Listwise损失函数（简洁版）：CE + Listwise Ranking
+
+    环境变量：
+    - PRICING_CHAIN_LENGTH: 序列长度（默认8）
+    - PRICING_CE_WEIGHT: CE权重（默认0.3）
+    - PRICING_LISTWISE_WEIGHT: Listwise权重（默认0.7）
+    - PRICING_LISTWISE_TEMP: Softmax温度（默认1.0）
+    """
+    logits = outputs.logits
+
+    # 处理logits形状
+    if len(logits.shape) == 2:
+        if logits.shape[1] == 1:
+            scores = logits.squeeze(-1)
+            use_bce = True
+        elif logits.shape[1] == 2:
+            scores = logits[:, 1]  # 正类的logit
+            use_bce = False
+        else:
+            raise ValueError(f"Unexpected logits shape: {logits.shape}")
+    else:
+        scores = logits
+        use_bce = True
+
+    labels_for_ce = labels.float() if use_bce else labels.long()
+
+    # 配置参数
+    # chain_length = int(os.environ.get('PRICING_CHAIN_LENGTH', '8'))
+    # ce_weight = float(os.environ.get('PRICING_CE_WEIGHT', '0.1'))
+    # listwise_weight = float(os.environ.get('PRICING_LISTWISE_WEIGHT', '0.9'))
+    # temperature = float(os.environ.get('PRICING_LISTWISE_TEMP', '0.5'))
+    chain_length = int(os.environ.get('PRICING_CHAIN_LENGTH', '8'))
+    ce_weight = float(os.environ.get('PRICING_CE_WEIGHT', '0.022'))
+    listwise_weight = float(os.environ.get('PRICING_LISTWISE_WEIGHT', '0.978'))
+    temperature = float(os.environ.get('PRICING_LISTWISE_TEMP', '0.5'))
+
+    batch_size = scores.size(0)
+
+    if batch_size % chain_length != 0:
+        raise ValueError(
+            f"Batch size ({batch_size}) must be divisible by chain_length ({chain_length})"
+        )
+
+    # 1. CE损失
+    if use_bce:
+        ce_loss = nn.BCEWithLogitsLoss()(
+            logits.squeeze(-1) if len(logits.shape) == 2 else logits,
+            labels_for_ce
+        )
+    else:
+        ce_loss = nn.CrossEntropyLoss()(logits, labels_for_ce)
+
+    # 2. Listwise Ranking损失
+    num_sequences = batch_size // chain_length
+    scores_reshaped = scores.view(num_sequences, chain_length)
+
+    # 理想分布：位置越靠后，概率越高（指数增长）
+    ideal_scores = torch.arange(chain_length, dtype=scores.dtype, device=scores.device)
+    ideal_scores = torch.exp(ideal_scores * 0.5)
+    ideal_scores = ideal_scores.unsqueeze(0).expand(num_sequences, -1)
+
+    # 计算softmax分布
+    pred_probs = torch.softmax(scores_reshaped / temperature, dim=1)
+    ideal_probs = torch.softmax(ideal_scores / temperature, dim=1)
+
+    # KL散度
+    listwise_loss = nn.KLDivLoss(reduction='batchmean')(
+        torch.log(pred_probs + 1e-10),
+        ideal_probs
+    )
+
+    # 组合损失
+    total_loss = ce_weight * ce_loss + listwise_weight * listwise_loss
+
+    return total_loss
+
+
+import swanlab
+
+
+def should_log_to_swanlab():
+    """
+    Check if current process should log to SwanLab.
+    Only main process (rank 0) should log in distributed training.
+    """
+    # Check if SwanLab run exists (only initialized on main process)
+    if swanlab.get_run() is None:
+        return False
+
+    # Additional safety: verify we're on main process in distributed training
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+
+    return True
+
+
+def to_scalar(value):
+    """
+    将输入值转换为标量
+    - 如果是 PyTorch Tensor 类型，调用 .item() 转为标量
+    - 如果是 float/int 等数值类型，直接返回原值
+    - 其他类型会尝试转换为 float，转换失败则抛出异常
+    """
+    if isinstance(value, torch.Tensor):
+        return value.item()
+    else:
+        return float(value)
+
+def pricing_listmle_loss(
+        outputs,
+        labels,
+        loss_scale=None,
+        num_items_in_batch=None,
+        **kwargs
+) -> torch.Tensor:
+    """
+    Pricing ListMLE Loss（反转排序版本）
+
+    数据格式：
+    - batch_size是8的倍数（如8, 16, 24...）
+    - 每8个样本为一组，对应同一用户
+    - 在每组内，位置0→7，接受概率递增
+      位置0: 低折扣(d0)  → 接受概率低 → score应该低
+      位置7: 高折扣(d140) → 接受概率高 → score应该高
+    - label用于CE loss，ListMLE部分不使用label
+
+    优化目标：
+    - ListMLE：最大化从高到低排序 [7,6,5,4,3,2,1,0] 的概率
+      即：s_7 > s_6 > ... > s_1 > s_0
+      等价于：s_0 < s_1 < ... < s_7 ✅
+    - CE：基础分类能力（使用label）
+
+    环境变量：
+    - PRICING_CHAIN_LENGTH: 每组样本数（默认8）
+    - PRICING_CE_WEIGHT: CE权重（默认0.1）
+    - PRICING_LISTMLE_WEIGHT: ListMLE权重（默认0.9）
+    - PRICING_LISTMLE_TEMP: 温度参数（默认1.0）
+
+    ListMLE公式：
+        理想排序 π = [7, 6, 5, 4, 3, 2, 1, 0]（反向位置顺序）
+        P(π) = ∏_{i=0}^{n-1} exp(s_{π_i}) / Σ_{j=i}^{n-1} exp(s_{π_j})
+        Loss = -log P(π)
+    """
+    logits = outputs.logits
+
+    # ========== 1. 处理logits形状 ==========
+    if len(logits.shape) == 2:
+        if logits.shape[1] == 1:
+            scores = logits.squeeze(-1)
+            use_bce = True
+            use_3class = False
+        elif logits.shape[1] == 2:
+            scores = logits[:, 1]  # 正类的logit
+            use_bce = False
+            use_3class = False
+        elif logits.shape[1] == 3:
+            # 三分类支持 - 使用对应类别的logit作为ranking score
+            # 原因：训练序列内label都相同，应该比较同类内的置信度差异
+            # 而非跨类别的加权组合（会导致label=0序列score全为0）
+            # 提取每个样本对应label的logit: scores[i] = logits[i, labels[i]]
+            scores = torch.gather(logits, dim=1, index=labels.unsqueeze(1)).squeeze(1)
+            use_bce = False
+            use_3class = True
+        else:
+            raise ValueError(f"Unexpected logits shape: {logits.shape}")
+    else:
+        scores = logits
+        use_bce = True
+        use_3class = False
+
+    labels_for_ce = labels.float() if use_bce else labels.long()
+
+    # ========== 2. 读取配置 ==========
+    # chain_length = int(os.environ.get('PRICING_CHAIN_LENGTH', '8'))
+    # ce_weight = float(os.environ.get('PRICING_CE_WEIGHT', '0.1'))
+    # listmle_weight = float(os.environ.get('PRICING_LISTMLE_WEIGHT', '0.9'))
+    # temperature = float(os.environ.get('PRICING_LISTMLE_TEMP', '1.0'))
+    chain_length = int(os.environ.get('PRICING_CHAIN_LENGTH', '8'))
+    ce_weight = float(os.environ.get('PRICING_CE_WEIGHT', '0.85'))
+    listmle_weight = float(os.environ.get('PRICING_LISTMLE_WEIGHT', '0.15'))
+    temperature = float(os.environ.get('PRICING_LISTMLE_TEMP', '1.0'))
+
+    batch_size = scores.size(0)
+
+    if batch_size % chain_length != 0:
+        raise ValueError(
+            f"Batch size ({batch_size}) must be divisible by chain_length ({chain_length})"
+        )
+
+    # ========== 3. CE损失（使用label） ==========
+    if use_3class:
+        ce_loss = nn.CrossEntropyLoss()(logits, labels_for_ce)
+    elif use_bce:
+        ce_loss = nn.BCEWithLogitsLoss()(
+            logits.squeeze(-1) if len(logits.shape) == 2 else logits,
+            labels_for_ce
+        )
+    else:
+        ce_loss = nn.CrossEntropyLoss()(logits, labels_for_ce)
+
+    # ========== 3.5. 计算预测标签和统计信息 ==========
+    with torch.no_grad():  # 不需要梯度
+        if use_3class:
+            # 三分类：获取概率最大的类别
+            predicted_labels = torch.argmax(logits, dim=-1)  # [batch_size]
+        elif use_bce:
+            # 二分类 BCE：概率 > 0.5 为正类
+            predicted_labels = (torch.sigmoid(logits.squeeze(-1) if len(logits.shape) == 2 else logits) > 0.5).long()
+        else:
+            # 二分类 CE：获取概率最大的类别
+            predicted_labels = torch.argmax(logits, dim=-1)
+
+        # 真实标签
+        true_labels = labels.long()
+
+        # 计算批次准确率
+        correct = (predicted_labels == true_labels).float()
+        batch_accuracy = correct.mean().item()
+
+        # 计算每个类别的准确率和样本数
+        label_stats = {}
+        num_classes = 3 if use_3class else 2
+
+        for label_idx in range(num_classes):
+            # 找到该类别的所有样本
+            label_mask = (true_labels == label_idx)
+            label_count = label_mask.sum().item()
+
+            if label_count > 0:
+                # 计算该类别的准确率
+                label_correct = correct[label_mask].sum().item()
+                label_accuracy = label_correct / label_count
+            else:
+                label_accuracy = 0.0
+
+            label_stats[f'label_{label_idx}_accuracy'] = label_accuracy
+            label_stats[f'label_{label_idx}_count'] = label_count
+
+    # ========== 4. ListMLE损失（不使用label，只用位置） ==========
+    num_sequences = batch_size // chain_length
+    total_listmle = 0.0
+
+    for seq_idx in range(num_sequences):
+        start = seq_idx * chain_length
+        end = start + chain_length
+
+        seq_scores = scores[start:end]  # [chain_length]
+
+        # 温度缩放
+        if temperature != 1.0:
+            seq_scores = seq_scores / temperature
+
+        # 🔄 关键：反转scores，使得理想排序变为 [7,6,5,4,3,2,1,0]
+        # 原始：seq_scores[0] 对应位置0 (低折扣)
+        #      seq_scores[7] 对应位置7 (高折扣)
+        # 反转后：reversed_scores[0] 对应位置7 (高折扣) ← 应该最先被选
+        #        reversed_scores[7] 对应位置0 (低折扣) ← 应该最后被选
+        reversed_scores = torch.flip(seq_scores, dims=[0])
+
+        # 计算ListMLE损失
+        # 理想排序：[位置7, 位置6, ..., 位置1, 位置0]
+        # Loss = -Σ_{i=0}^{n-1} [reversed_scores[i] - log_sum_exp(reversed_scores[i:])]
+        listmle = 0.0
+        for i in range(chain_length):
+            numerator = reversed_scores[i]
+            remaining_scores = reversed_scores[i:]
+            denominator = torch.logsumexp(remaining_scores, dim=0)
+            listmle -= (numerator - denominator)
+
+        total_listmle += listmle
+
+    # 平均ListMLE损失
+    avg_listmle = total_listmle / num_sequences
+
+    # ========== 5. 组合损失与日志记录 ==========
+    total_loss = ce_weight * ce_loss + listmle_weight * avg_listmle
+
+    # 构建日志字典
+    log_dict = {
+        "ce_loss": to_scalar(ce_loss),
+        "listmle_loss": to_scalar(avg_listmle),
+        "total_loss": to_scalar(total_loss),
+        "batch_accuracy": batch_accuracy,
+    }
+
+    # 添加每个类别的统计信息
+    log_dict.update(label_stats)
+
+    # 记录到 swanlab
+    if should_log_to_swanlab():
+        swanlab.log(log_dict)
+
+    return total_loss
+
+
+def bank_rank_listwise_loss(outputs, labels, loss_scale=None, num_items_in_batch=None,
+                            **kwargs) -> torch.Tensor:
+    """
+    多城市银行推荐Listwise损失（修复版）
+
+    核心思路：
+    1. CE Loss: 基础分类损失
+    2. Ranking Loss: 使用KL散度优化排序分布
+       - 理想分布：第1>第2>其他，且呈指数递减
+
+    数据格式：
+    - 每个chain由chain_length个样本组成
+    - 第1个: Ground Truth (label=1)
+    - 第2-N个: 按流行度排序的负样本 (label=0)
+
+    环境变量：
+    - BANK_CHAIN_LENGTH: 序列长度（默认8）
+    - BANK_CE_WEIGHT: CE权重（默认0.3）
+    - BANK_RANKING_WEIGHT: Ranking权重（默认0.7）
+    - BANK_RANKING_TEMP: Softmax温度（默认0.5）
+    - BANK_TOP2_FACTOR: Top-2权重因子（默认0.7，范围0-1）
+    - BANK_RANKING_MODE: 排序模式（默认'gt_only'）
+
+    Args:
+        outputs: 模型输出
+        labels: 二值标签
+
+    Returns:
+        torch.Tensor: 组合损失
+    """
+
+    logits = outputs.logits  # [batch_size, num_classes]
+
+    # ========== 配置参数 ==========
+    chain_length = int(os.environ.get('BANK_CHAIN_LENGTH', '8'))
+    ce_weight = float(os.environ.get('BANK_CE_WEIGHT', '0.3'))
+    ranking_weight = float(os.environ.get('BANK_RANKING_WEIGHT', '0.7'))
+    temperature = float(os.environ.get('BANK_RANKING_TEMP', '0.5'))
+    top2_factor = float(os.environ.get('BANK_TOP2_FACTOR', '0.7'))
+    ranking_mode = os.environ.get('BANK_RANKING_MODE', 'gt_only')
+
+    batch_size = logits.size(0)
+    num_classes = logits.size(1)
+
+    # ========== 验证batch size ==========
+    if batch_size % chain_length != 0:
+        raise ValueError(
+            f"Batch size ({batch_size}) must be divisible by chain_length ({chain_length})"
+        )
+
+    num_sequences = batch_size // chain_length
+
+    # ========== Part 1: 提取GT样本（修复） ==========
+    # 直接使用每个sequence的第一个样本作为GT
+    # 而不是依赖label==1来查找
+
+    # Reshape logits: [num_sequences, chain_length, num_classes]
+    logits_reshaped = logits.view(num_sequences, chain_length, num_classes)
+
+    # 提取第一个位置的logits作为GT样本
+    gt_logits = logits_reshaped[:, 0, :]  # [num_sequences, num_classes]
+
+    # 获取GT类别
+    gt_classes = torch.argmax(gt_logits, dim=-1)  # [num_sequences]
+
+    # ========== Part 2: CE损失 ==========
+    ce_loss = nn.CrossEntropyLoss()(gt_logits, gt_classes)
+
+    # ========== Part 3: 提取Ranking Scores ==========
+    if ranking_mode == 'gt_only':
+        # 使用GT类别的logit作为ranking score
+        gt_classes_expanded = gt_classes.unsqueeze(1).unsqueeze(2)  # [num_sequences, 1, 1]
+        gt_classes_expanded = gt_classes_expanded.expand(-1, chain_length, -1)  # [num_sequences, chain_length, 1]
+        ranking_scores = torch.gather(logits_reshaped, 2, gt_classes_expanded).squeeze(-1)
+        # ranking_scores: [num_sequences, chain_length]
+
+    elif ranking_mode == 'top_k':
+        top_k = min(5, num_classes)
+        top_k_logits, _ = torch.topk(logits_reshaped, k=top_k, dim=2)
+        ranking_scores = top_k_logits.mean(dim=2)
+
+    elif ranking_mode == 'weighted':
+        probs = torch.softmax(logits_reshaped, dim=2)
+        ranking_scores = (probs * logits_reshaped).sum(dim=2)
+
+    else:
+        raise ValueError(f"Unknown ranking_mode: {ranking_mode}")
+
+    # ========== Part 4: 构建理想分布 ==========
+    ideal_scores = torch.zeros(chain_length, dtype=ranking_scores.dtype, device=ranking_scores.device)
+
+    # 第1个位置：权重1.0
+    ideal_scores[0] = 1.0
+
+    # 第2个位置：权重top2_factor（默认0.7）
+    ideal_scores[1] = top2_factor
+
+    # 其他位置：指数递减
+    if chain_length > 2:
+        decay_positions = torch.arange(2, chain_length, dtype=ranking_scores.dtype, device=ranking_scores.device)
+        ideal_scores[2:] = top2_factor * torch.exp(-(decay_positions - 2) * 0.5)
+
+    # 扩展到所有序列
+    ideal_scores = ideal_scores.unsqueeze(0).expand(num_sequences, -1)
+
+    # ========== Part 5: KL散度（Ranking Loss） ==========
+    pred_probs = torch.softmax(ranking_scores / temperature, dim=1)
+    ideal_probs = torch.softmax(ideal_scores / temperature, dim=1)
+
+    # KL散度：D_KL(ideal || pred)
+    ranking_loss = nn.KLDivLoss(reduction='batchmean')(
+        torch.log(pred_probs + 1e-10),
+        ideal_probs
+    )
+
+    # ========== 组合损失 ==========
+    total_loss = ce_weight * ce_loss + ranking_weight * ranking_loss
+
+    return total_loss
+
+def pricing_focal_loss(
+        outputs,
+        labels,
+        loss_scale=None,
+        num_items_in_batch=None,
+        **kwargs
+) -> torch.Tensor:
+    """
+    Pricing Focal Loss + ListMLE Loss（二分类使用Focal Loss处理类别不平衡）
+
+    数据格式：
+    - batch_size是8的倍数（如8, 16, 24...）
+    - 每8个样本为一组，对应同一用户
+    - 在每组内，位置0→7，接受概率递增
+      位置0: 低折扣(d0)  → 接受概率低 → score应该低
+      位置7: 高折扣(d140) → 接受概率高 → score应该高
+    - label用于Focal loss，ListMLE部分不使用label
+
+    类别分布：
+    - 正类(1) : 负类(0) ≈ 1:10
+    - 使用Focal Loss来更关注正类（少数类）
+
+    优化目标：
+    - Focal Loss：处理类别不平衡，更关注难分类样本和正类
+    - ListMLE：最大化从高到低排序 [7,6,5,4,3,2,1,0] 的概率
+
+    环境变量：
+    - PRICING_CHAIN_LENGTH: 每组样本数（默认8）
+    - PRICING_FOCAL_WEIGHT: Focal Loss权重（默认0.85）
+    - PRICING_LISTMLE_WEIGHT: ListMLE权重（默认0.15）
+    - PRICING_LISTMLE_TEMP: 温度参数（默认1.0）
+    - PRICING_FOCAL_ALPHA: Focal Loss的alpha参数，正类权重（默认0.75）
+    - PRICING_FOCAL_GAMMA: Focal Loss的gamma参数，聚焦参数（默认2.0）
+
+    Focal Loss公式：
+        FL(p_t) = -α_t * (1 - p_t)^γ * log(p_t)
+        其中 p_t 是正确类别的预测概率
+    """
+    logits = outputs.logits
+
+    # ========== 1. 处理logits形状 ==========
+    if len(logits.shape) == 2:
+        if logits.shape[1] == 1:
+            scores = logits.squeeze(-1)
+            use_bce = True
+            use_3class = False
+        elif logits.shape[1] == 2:
+            scores = logits[:, 1]  # 正类的logit
+            use_bce = False
+            use_3class = False
+        elif logits.shape[1] == 3:
+            # 三分类支持 - 使用对应类别的logit作为ranking score
+            scores = torch.gather(logits, dim=1, index=labels.unsqueeze(1)).squeeze(1)
+            use_bce = False
+            use_3class = True
+        else:
+            raise ValueError(f"Unexpected logits shape: {logits.shape}")
+    else:
+        scores = logits
+        use_bce = True
+        use_3class = False
+
+    labels_for_focal = labels.float()
+
+    # ========== 2. 读取配置 ==========
+    chain_length = int(os.environ.get('PRICING_CHAIN_LENGTH', '8'))
+    focal_weight = float(os.environ.get('PRICING_FOCAL_WEIGHT', '0.85'))
+    listmle_weight = float(os.environ.get('PRICING_LISTMLE_WEIGHT', '0.15'))
+    temperature = float(os.environ.get('PRICING_LISTMLE_TEMP', '1.0'))
+
+    # Focal Loss参数
+    focal_alpha = float(os.environ.get('PRICING_FOCAL_ALPHA', '0.85'))  # 正类权重，范围[0,1]
+    focal_gamma = float(os.environ.get('PRICING_FOCAL_GAMMA', '2.0'))  # 聚焦参数，通常为2
+
+    batch_size = scores.size(0)
+
+    if batch_size % chain_length != 0:
+        raise ValueError(
+            f"Batch size ({batch_size}) must be divisible by chain_length ({chain_length})"
+        )
+
+    # ========== 3. Focal Loss（针对二分类） ==========
+    if use_3class:
+        # 三分类暂时使用标准CE，可以后续扩展为多分类Focal Loss
+        focal_loss = nn.CrossEntropyLoss()(logits, labels.long())
+    else:
+        # 二分类使用Focal Loss
+        if use_bce or logits.shape[1] == 1:
+            # 单输出logit的情况
+            logits_for_focal = logits.squeeze(-1) if len(logits.shape) == 2 else logits
+        else:
+            # 双输出logit的情况，提取正类logit
+            logits_for_focal = logits[:, 1] - logits[:, 0]  # log(p1/p0)
+
+        # 计算概率 p
+        probs = torch.sigmoid(logits_for_focal)
+
+        # 计算 p_t：正确类别的预测概率
+        # 当label=1时，p_t=p；当label=0时，p_t=1-p
+        p_t = probs * labels_for_focal + (1 - probs) * (1 - labels_for_focal)
+
+        # 计算 α_t：正类使用alpha，负类使用1-alpha
+        # alpha越大，对正类的关注越多（适合正类样本少的情况）
+        alpha_t = focal_alpha * labels_for_focal + (1 - focal_alpha) * (1 - labels_for_focal)
+
+        # 计算 Focal Loss
+        # FL = -α_t * (1 - p_t)^γ * log(p_t)
+        focal_weight_factor = (1 - p_t) ** focal_gamma
+        focal_loss = -alpha_t * focal_weight_factor * torch.log(p_t + 1e-8)
+        focal_loss = focal_loss.mean()
+
+    # ========== 3.5. 计算预测标签和统计信息 ==========
+    with torch.no_grad():  # 不需要梯度
+        if use_3class:
+            # 三分类：获取概率最大的类别
+            predicted_labels = torch.argmax(logits, dim=-1)  # [batch_size]
+        elif use_bce or logits.shape[1] == 1:
+            # 二分类 BCE：概率 > 0.5 为正类
+            predicted_labels = (torch.sigmoid(logits.squeeze(-1) if len(logits.shape) == 2 else logits) > 0.5).long()
+        else:
+            # 二分类双输出：获取概率最大的类别
+            predicted_labels = torch.argmax(logits, dim=-1)
+
+        # 真实标签
+        true_labels = labels.long()
+
+        # 计算批次准确率
+        correct = (predicted_labels == true_labels).float()
+        batch_accuracy = correct.mean().item()
+
+        # 计算每个类别的准确率、样本数和召回率
+        label_stats = {}
+        num_classes = 3 if use_3class else 2
+
+        for label_idx in range(num_classes):
+            # 找到该类别的所有样本（真实标签）
+            label_mask = (true_labels == label_idx)
+            label_count = label_mask.sum().item()
+
+            if label_count > 0:
+                # 计算该类别的准确率（在该类别中预测正确的比例）
+                label_correct = correct[label_mask].sum().item()
+                label_accuracy = label_correct / label_count
+
+                # 计算该类别的召回率（有多少该类别的样本被正确预测）
+                predicted_as_label = (predicted_labels == label_idx)
+                true_positive = (label_mask & predicted_as_label).sum().item()
+                recall = true_positive / label_count
+            else:
+                label_accuracy = 0.0
+                recall = 0.0
+
+            label_stats[f'label_{label_idx}_accuracy'] = label_accuracy
+            label_stats[f'label_{label_idx}_recall'] = recall
+            label_stats[f'label_{label_idx}_count'] = label_count
+
+    # ========== 4. ListMLE损失（不使用label，只用位置） ==========
+    # num_sequences = batch_size // chain_length
+    # total_listmle = 0.0
+    #
+    # for seq_idx in range(num_sequences):
+    #     start = seq_idx * chain_length
+    #     end = start + chain_length
+    #
+    #     seq_scores = scores[start:end]  # [chain_length]
+    #
+    #     # 温度缩放
+    #     if temperature != 1.0:
+    #         seq_scores = seq_scores / temperature
+    #
+    #     # 🔄 关键：反转scores，使得理想排序变为 [7,6,5,4,3,2,1,0]
+    #     # 原始：seq_scores[0] 对应位置0 (低折扣)
+    #     #      seq_scores[7] 对应位置7 (高折扣)
+    #     # 反转后：reversed_scores[0] 对应位置7 (高折扣) ← 应该最先被选
+    #     #        reversed_scores[7] 对应位置0 (低折扣) ← 应该最后被选
+    #     reversed_scores = torch.flip(seq_scores, dims=[0])
+    #
+    #     # 计算ListMLE损失
+    #     # 理想排序：[位置7, 位置6, ..., 位置1, 位置0]
+    #     # Loss = -Σ_{i=0}^{n-1} [reversed_scores[i] - log_sum_exp(reversed_scores[i:])]
+    #     listmle = 0.0
+    #     for i in range(chain_length):
+    #         numerator = reversed_scores[i]
+    #         remaining_scores = reversed_scores[i:]
+    #         denominator = torch.logsumexp(remaining_scores, dim=0)
+    #         listmle -= (numerator - denominator)
+    #
+    #     total_listmle += listmle
+    #
+    # # 平均ListMLE损失
+    # avg_listmle = total_listmle / num_sequences
+
+    # ========== 5. 组合损失与日志记录 ==========
+    total_loss = focal_weight * focal_loss# + listmle_weight * avg_listmle
+
+    # 构建日志字典
+    log_dict = {
+        "focal_loss": to_scalar(focal_loss),
+        #"listmle_loss": to_scalar(avg_listmle),
+        "total_loss": to_scalar(total_loss),
+        "batch_accuracy": batch_accuracy,
+    }
+
+    # 添加每个类别的统计信息
+    log_dict.update(label_stats)
+
+    # 记录到 swanlab
+    if should_log_to_swanlab():
+        swanlab.log(log_dict)
+
+    return total_loss
+
+
+def ce_loss_func(outputs, labels, **kwargs):
+    """Cross entropy loss function that returns per-token losses and masks.
+
+    Args:
+        outputs: The model outputs containing logits
+        labels: The labels tensor [batch_size, seq_len]
+
+    Returns:
+        loss: Per-token cross entropy loss (only for valid tokens where label != -100)
+        masks: Boolean mask indicating valid positions (label != -100)
+    """
+    logits = outputs.logits
+    # Upcast to float if we need to compute the loss to avoid potential precision issues
+    logits = logits.float()
+
+    # Shift so that tokens < n predict n
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+
+    # Flatten the tokens
+    shift_logits = shift_logits.view(-1, shift_logits.shape[-1])
+    shift_labels = shift_labels.view(-1)
+
+    # Enable model parallelism
+    shift_labels = shift_labels.to(shift_logits.device)
+
+    # Compute per-token loss without reduction
+    loss_fct = CrossEntropyLoss(reduction='none', ignore_index=-100)
+    loss = loss_fct(shift_logits, shift_labels)
+
+    # Create mask for valid tokens (label != -100)
+    masks = shift_labels != -100
+
+    # Only keep losses for valid tokens
+    loss = loss[masks]
+
+    return loss, masks
+
+
+def scale_loss_func(outputs, labels, loss_scale=None, num_items_in_batch=None, **kwargs) -> torch.Tensor:
+    """Loss func with token-level scaling based on configuration.
+
+    This function applies different loss weights to different parts of the response
+    based on the loss_scale configuration (e.g., ignore_empty_think.json).
+    It protects model's thinking ability by setting zero weights for empty think tags.
+
+    Args:
+        outputs: The model outputs containing logits
+        labels: The labels tensor [batch_size, seq_len]
+        loss_scale: Loss scale tensor [batch_size, seq_len] with weights for each token
+        num_items_in_batch: Number of tokens in the labels of gradient accumulation round that are not -100.
+
+    Returns:
+        Scalar loss value
+    """
+    loss, masks = ce_loss_func(outputs, labels)
+
+    if loss_scale is not None:
+        # Shift loss_scale to match the shifted labels (skip first token)
+        shift_scale = loss_scale[..., 1:].contiguous().to(masks.device)
+
+        # Flatten
+        shift_scale = shift_scale.view(-1)
+
+        # ===== DEBUG: Check for shape mismatch =====
+        if shift_scale.shape[0] != masks.shape[0]:
+            import logging
+            logger = logging.getLogger(__name__)
+
+            logger.warning("=" * 70)
+            logger.warning(f"[DEBUG] Shape mismatch detected in scale_loss_func!")
+            logger.warning(f"[DEBUG] Original shapes:")
+            logger.warning(f"  labels.shape: {labels.shape}")
+            logger.warning(f"  loss_scale.shape: {loss_scale.shape}")
+            logger.warning(f"  outputs.logits.shape: {outputs.logits.shape}")
+
+            logger.warning(f"[DEBUG] After shift and flatten:")
+            logger.warning(f"  shift_scale.shape: {shift_scale.shape}")
+            logger.warning(f"  masks.shape: {masks.shape}")
+            logger.warning(f"  Difference: {shift_scale.shape[0] - masks.shape[0]} tokens")
+
+            # Per-sample analysis
+            if labels.dim() == 2:
+                batch_size = labels.shape[0]
+                logger.warning(f"[DEBUG] Per-sample analysis (batch_size={batch_size}):")
+                for i in range(min(batch_size, 3)):  # Only print first 3 samples
+                    label_len = labels[i].shape[0]
+                    scale_len = loss_scale[i].shape[0]
+                    valid_labels = (labels[i] != -100).sum().item()
+                    logger.warning(f"  Sample {i}: label_len={label_len}, scale_len={scale_len}, "
+                                 f"valid_labels={valid_labels}, diff={scale_len - label_len}")
+            logger.warning("=" * 70)
+        # ===========================================
+
+        # Check and align length if mismatch
+        if shift_scale.shape[0] != masks.shape[0]:
+            if shift_scale.shape[0] > masks.shape[0]:
+                # Truncate
+                shift_scale = shift_scale[:masks.shape[0]]
+            else:
+                # Pad with default weight 1.0
+                padding_size = masks.shape[0] - shift_scale.shape[0]
+                padding = torch.ones(
+                    padding_size,
+                    dtype=shift_scale.dtype,
+                    device=shift_scale.device
+                )
+                shift_scale = torch.cat([shift_scale, padding])
+
+        # Apply mask to get scales for valid tokens only
+        shift_scale = shift_scale[masks]
+
+        # ========== Visualize loss_scale distribution ==========
+        with torch.no_grad():
+            # Get unique scale values and their counts
+            unique_scales = shift_scale.unique()
+            scale_distribution = {}
+
+            for scale_value in unique_scales:
+                count = (shift_scale == scale_value).sum().item()
+                scale_key = f"scale_{float(scale_value):.1f}"
+                scale_distribution[f"loss_scale/{scale_key}_count"] = count
+
+                # Calculate percentage
+                total_tokens = len(shift_scale)
+                scale_distribution[f"loss_scale/{scale_key}_pct"] = 100.0 * count / total_tokens if total_tokens > 0 else 0.0
+
+                # Calculate weighted loss contribution for this scale
+                scale_mask = shift_scale == scale_value
+                if scale_mask.any():
+                    scale_loss = (loss[scale_mask] * scale_value).sum().item()
+                    scale_distribution[f"loss_scale/{scale_key}_loss_contrib"] = scale_loss
+
+            # Add total token count
+            scale_distribution["loss_scale/total_valid_tokens"] = len(shift_scale)
+
+            # Log to swanlab
+            if should_log_to_swanlab():
+                swanlab.log(scale_distribution)
+        # =======================================================
+
+        # Apply loss scaling: zero weight for empty think, higher weight for answer
+        loss = shift_scale * loss
+
+    if num_items_in_batch is None:
+        loss = loss.mean()
+    else:
+        # compat transformers>=4.46
+        loss = loss.sum() / num_items_in_batch
+    return loss
+
+
+
+def scale_per_token_loss_func(outputs, labels, loss_scale=None, enable_dft_loss: bool = False, **kwargs):
+    logits = outputs.logits
+    # Upcast to float if we need to compute the loss to avoid potential precision issues
+    logits = logits.float()
+    labels = torch.roll(labels, shifts=-1, dims=-1).view(-1)
+
+    # Flatten the tokens
+    logits = logits.view(-1, logits.shape[-1])
+    # Enable model parallelism
+    labels = labels.to(logits.device)
+    loss = F.cross_entropy(logits, labels, ignore_index=-100, reduction='none')
+    if enable_dft_loss:
+        with torch.no_grad():
+            target_probs = torch.exp(-loss)
+        loss *= target_probs
+
+    # Apply loss scaling if provided
+    if loss_scale is not None:
+        # Shift loss_scale to align with rolled labels
+        shift_scale = torch.roll(loss_scale, shifts=-1, dims=-1).view(-1).to(loss.device)
+
+        # Handle shape mismatch (edge case)
+        if shift_scale.shape[0] != loss.shape[0]:
+            if shift_scale.shape[0] > loss.shape[0]:
+                # Truncate extra positions
+                shift_scale = shift_scale[:loss.shape[0]]
+            else:
+                # Pad with default weight 1.0
+                padding_size = loss.shape[0] - shift_scale.shape[0]
+                padding = torch.ones(padding_size, dtype=shift_scale.dtype, device=shift_scale.device)
+                shift_scale = torch.cat([shift_scale, padding])
+
+        # Apply scaling: zero weight for empty think, higher weight for answer
+        loss = loss * shift_scale
+
+    return loss
+
+def scale_cross_entropy_loss_func(outputs, labels, loss_scale=None, num_items_in_batch=None, **kwargs):
+    """Cross entropy loss function with token-level scaling.
+
+    This function applies different loss weights to different parts of the response
+    based on the loss_scale configuration (e.g., ignore_empty_think.json).
+
+    Args:
+        outputs: The model outputs containing logits
+        labels: The labels tensor [batch_size, seq_len]
+        loss_scale: Loss scale tensor [batch_size, seq_len] with weights for each token
+        num_items_in_batch: Number of tokens that are not -100 for normalization
+
+    Returns:
+        Scalar loss value
+    """
+    # ========== Log loss_scale distribution to swanlab (BEFORE scaling) ==========
+    if loss_scale is not None:
+        # Get unscaled per-token loss for logging
+        token_loss_unscaled = scale_per_token_loss_func(outputs, labels, loss_scale=None, **kwargs)
+
+        with torch.no_grad():
+            # Shift loss_scale to align with rolled labels
+            shift_scale = torch.roll(loss_scale, shifts=-1, dims=-1).view(-1)
+
+            # Filter out positions with -100 labels (padding/input tokens)
+            rolled_labels = torch.roll(labels, shifts=-1, dims=-1).view(-1)
+            valid_mask = rolled_labels != -100
+
+            # Also filter token_loss_unscaled to only valid positions
+            # token_loss_unscaled has shape [batch*seq_len], with 0 loss at -100 positions
+            # But we need to filter it to match shift_scale_valid
+            token_loss_unscaled_valid = token_loss_unscaled[valid_mask]
+            shift_scale_valid = shift_scale[valid_mask]
+
+            # Get unique scale values and their counts
+            unique_scales = shift_scale_valid.unique()
+            scale_distribution = {}
+
+            for scale_value in unique_scales:
+                count = (shift_scale_valid == scale_value).sum().item()
+                scale_key = f"scale_{float(scale_value):.1f}"
+
+                # Count of tokens with this scale
+                scale_distribution[f"loss_scale/{scale_key}_count"] = count
+
+                # Percentage of tokens with this scale
+                total_tokens = len(shift_scale_valid)
+                scale_distribution[f"loss_scale/{scale_key}_pct"] = 100.0 * count / total_tokens if total_tokens > 0 else 0.0
+
+                # Calculate weighted loss contribution for this scale
+                # Use unscaled loss and multiply by scale_value
+                scale_mask = shift_scale_valid == scale_value
+                if scale_mask.any():
+                    scale_loss = (token_loss_unscaled_valid[scale_mask] * scale_value).sum().item()
+                    scale_distribution[f"loss_scale/{scale_key}_loss_contrib"] = scale_loss
+
+            # Add total valid token count
+            scale_distribution["loss_scale/total_valid_tokens"] = len(shift_scale_valid)
+
+            # Log to swanlab
+            if should_log_to_swanlab():
+                swanlab.log(scale_distribution)
+    # ==========================================================
+
+    # Get per-token loss with scaling applied
+    token_loss = scale_per_token_loss_func(outputs, labels, loss_scale=loss_scale, **kwargs)
+
+    # Aggregate loss
+    if num_items_in_batch is None:
+        num_items_in_batch = (labels[:, 1:] != -100).sum()
+    return token_loss.sum() / num_items_in_batch
+
+def detect_category_from_loss_scale(loss_scale_tensor):
+    """从 loss_scale 张量检测样本类别
+
+    根据 ignore_empty_think.json 中的配置：
+    - 曝光：<answer> 内容权重为 100.0
+    - 领取：<answer> 内容权重为 300.0
+    - 核销：<answer> 内容权重为 400.0
+
+    参数：
+        loss_scale_tensor: 单个样本的 loss_scale 张量 [seq_len]
+
+    返回：
+        类别名称（'曝光'/'领取'/'核销'）或 None
+    """
+
+    # 将 loss_scale_tensor 移到 CPU 并转换为 float（避免设备和 dtype 问题）
+    scale_values = loss_scale_tensor.cpu().float()
+    debug_dict = {"scale_values": scale_values}
+
+    # 检查是否包含特定的权重值（使用容差处理浮点数精度）
+    has_400 = torch.any(torch.isclose(scale_values, torch.tensor(4000.0), rtol=1e-5))
+    has_300 = torch.any(torch.isclose(scale_values, torch.tensor(2000.0), rtol=1e-5))
+    has_100 = torch.any(torch.isclose(scale_values, torch.tensor(1000.0), rtol=1e-5))
+
+    # 优先级：核销 > 领取 > 曝光（因为权重值更大更特异）
+    if has_400:
+        category = '核销'
+    elif has_300:
+        category = '领取'
+    elif has_100:
+        category = '曝光'
+    else:
+        category = None
+
+    return category, debug_dict
+
+def category_weighted_loss_func(outputs, labels, loss_scale=None, num_items_in_batch=None, trainer=None, **kwargs):
+    """带有 token 级缩放和样本级类别加权的交叉熵损失函数。
+
+    此函数应用：
+    1. 来自 loss_scale 配置的 token 级权重
+    2. 基于 <answer> 内容的样本级类别权重
+
+    类别权重通过环境变量配置：
+    - CATEGORY_WEIGHT_曝光（默认：1.0）
+    - CATEGORY_WEIGHT_领取（默认：10.0）
+    - CATEGORY_WEIGHT_核销（默认：100.0）
+
+    参数：
+        outputs: 包含 logits 的模型输出
+        labels: Labels 张量 [batch_size, seq_len]
+        loss_scale: Loss scale 张量 [batch_size, seq_len]，每个 token 的权重
+        num_items_in_batch: 用于归一化的非 -100 token 数量
+        trainer: Trainer 实例，用于访问 tokenizer
+
+    返回：
+        标量 loss 值
+    """
+    import os
+
+    # 从环境变量读取类别权重
+    category_weights = {
+        '曝光': float(os.environ.get('CATEGORY_WEIGHT_曝光', '1.0')),
+        '领取': float(os.environ.get('CATEGORY_WEIGHT_领取', '10.0')),
+        '核销': float(os.environ.get('CATEGORY_WEIGHT_核销', '100.0')),
+    }
+
+    # ========== 记录 loss_scale 分布到 swanlab（缩放前）==========
+    if loss_scale is not None:
+        # 获取未缩放的 per-token loss 用于日志记录
+        token_loss_unscaled = scale_per_token_loss_func(outputs, labels, loss_scale=None, **kwargs)
+
+        with torch.no_grad():
+            # 移位 loss_scale 以对齐 rolled labels
+            shift_scale = torch.roll(loss_scale, shifts=-1, dims=-1).view(-1)
+
+            # 过滤掉 -100 labels 的位置（填充/输入 token）
+            rolled_labels = torch.roll(labels, shifts=-1, dims=-1).view(-1)
+            valid_mask = rolled_labels != -100
+
+            token_loss_unscaled_valid = token_loss_unscaled[valid_mask]
+            shift_scale_valid = shift_scale[valid_mask]
+
+            # 获取唯一的 scale 值及其计数
+            unique_scales = shift_scale_valid.unique()
+            scale_distribution = {}
+
+            for scale_value in unique_scales:
+                count = (shift_scale_valid == scale_value).sum().item()
+                scale_key = f"scale_{float(scale_value):.1f}"
+
+                # 具有此 scale 的 token 计数
+                scale_distribution[f"loss_scale/{scale_key}_count"] = count
+
+                # 具有此 scale 的 token 百分比
+                total_tokens = len(shift_scale_valid)
+                scale_distribution[f"loss_scale/{scale_key}_pct"] = 100.0 * count / total_tokens if total_tokens > 0 else 0.0
+
+                # 计算此 scale 的加权 loss 贡献
+                scale_mask = shift_scale_valid == scale_value
+                if scale_mask.any():
+                    scale_loss = (token_loss_unscaled_valid[scale_mask] * scale_value).sum().item()
+                    scale_distribution[f"loss_scale/{scale_key}_loss_contrib"] = scale_loss
+
+            # 添加总有效 token 计数
+            scale_distribution["loss_scale/total_valid_tokens"] = len(shift_scale_valid)
+
+            # 记录到 swanlab
+            if should_log_to_swanlab():
+                swanlab.log(scale_distribution)
+    # ==========================================================
+
+    # 获取应用缩放后的 per-token loss
+    token_loss = scale_per_token_loss_func(outputs, labels, loss_scale=loss_scale, **kwargs)
+
+    # ========== 应用样本级类别加权 ==========
+    if loss_scale is not None:
+        batch_size = labels.shape[0]
+
+        # 将 token_loss 重塑为 [batch_size, seq_len-1]
+        token_loss_2d = token_loss.view(batch_size, -1)
+
+        # 将 loss_scale 重塑为 2D，确保与 token_loss_2d 形状一致
+        if loss_scale.dim() == 1:
+            # loss_scale 是 1D [total_tokens]，重塑为 [batch_size, seq_len]
+            loss_scale_2d = loss_scale.view(batch_size, -1)
+        elif loss_scale.dim() == 2:
+            # loss_scale 已经是 2D
+            loss_scale_2d = loss_scale
+        else:
+            # 意外的形状，尝试重塑
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Unexpected loss_scale shape: {loss_scale.shape}, dim={loss_scale.dim()}")
+            loss_scale_2d = loss_scale.view(batch_size, -1)
+
+        # 对每个样本检测类别并应用权重
+        category_stats = {'曝光': 0, '领取': 0, '核销': 0, 'unknown': 0}
+        weighted_losses = []
+
+        for i in range(batch_size):
+            # 从 loss_scale 检测类别（新方法）
+            # 重要：对 loss_scale 进行 roll 对齐，与前面的 loss_scale 分布日志保持一致
+            # 使用 loss_scale_2d[i] 获取单个样本的 loss_scale (1D tensor)
+            sample_loss_scale = loss_scale_2d[i]  # [seq_len]
+
+            # Roll 对齐（对 1D tensor 使用 dims=0）
+            sample_loss_scale = torch.roll(sample_loss_scale, shifts=-1, dims=0)
+
+            category, _ = detect_category_from_loss_scale(sample_loss_scale)
+
+            sample_loss = token_loss_2d[i]
+
+            if category in category_weights:
+                weight = category_weights[category]
+                weighted_sample_loss = sample_loss * weight
+                category_stats[category] += 1
+            else:
+                # 未检测到类别，使用默认权重 1.0
+                weighted_sample_loss = sample_loss
+                category_stats['unknown'] += 1
+
+            weighted_losses.append(weighted_sample_loss)
+
+        # 连接回 1D
+        token_loss = torch.cat(weighted_losses, dim=0)
+
+        # 记录类别分布到 swanlab
+        if should_log_to_swanlab():
+            with torch.no_grad():
+                category_log = {
+                    'category/曝光_count': category_stats['曝光'],
+                    'category/领取_count': category_stats['领取'],
+                    'category/核销_count': category_stats['核销'],
+                    'category/unknown_count': category_stats['unknown'],
+                    'category/曝光_weight': category_weights['曝光'],
+                    'category/领取_weight': category_weights['领取'],
+                    'category/核销_weight': category_weights['核销'],
+                }
+                swanlab.log(category_log)
+    else:
+        # 如果没有 loss_scale，无法检测类别
+        pass
+    # ==========================================================
+
+    # 聚合 loss
+    if num_items_in_batch is None:
+        num_items_in_batch = (labels[:, 1:] != -100).sum()
+    return token_loss.sum() / num_items_in_batch
+
+def extract_category_from_tokens(token_ids, tokenizer):
+    """使用正则表达式从 <answer> 标签中提取类别
+
+    参数：
+        token_ids: Token IDs 张量或列表
+        tokenizer: Tokenizer 实例
+
+    返回：
+        类别名称（'曝光'/'领取'/'核销'）或 None
+    """
+    try:
+        # 解码 token IDs 为文本
+        if isinstance(token_ids, torch.Tensor):
+            token_ids_list = token_ids.cpu().tolist()
+        else:
+            token_ids_list = token_ids
+
+        text = tokenizer.decode(token_ids_list, skip_special_tokens=False)
+
+        # 使用正则表达式从 <answer> 标签中提取类别
+        # 优先级：核销 > 领取 > 曝光（因为可能包含多个词）
+        patterns = [
+            (r'<answer>([\s\S]*?核销[\s\S]*?)</answer>', '核销'),
+            (r'<answer>([\s\S]*?领取[\s\S]*?)</answer>', '领取'),
+            (r'<answer>([\s\S]*?曝光[\s\S]*?)</answer>', '曝光'),
+        ]
+
+        # Debug: 保存 token IDs 信息
+        debug_token_info = {
+            'token_ids_type': str(type(token_ids)),
+            'token_ids_shape': str(token_ids.shape) if isinstance(token_ids,
+                                                                  torch.Tensor) else f'list_len_{len(token_ids_list)}',
+            'token_ids_sample': token_ids_list[:50] if len(token_ids_list) > 50 else token_ids_list,
+            'token_ids_min': min(token_ids_list) if len(token_ids_list) > 0 else None,
+            'token_ids_max': max(token_ids_list) if len(token_ids_list) > 0 else None,
+            'vocab_size': tokenizer.vocab_size if hasattr(tokenizer, 'vocab_size') else 'unknown',
+            'text': text
+        }
+
+        for pattern, category in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return category, debug_token_info
+
+        # 提取失败
+        return None, debug_token_info
+    except Exception as e:
+        import traceback
+        return None, {'error_extract_category_from_tokens': traceback.format_exc()}
+
+def category_weighted_loss_with_aux_classification(outputs, labels, loss_scale=None, num_items_in_batch=None, trainer=None, **kwargs):
+    """带有辅助分类Loss的类别加权损失函数
+
+    结合token级别loss和分类级别loss，直接优化分类准确率。
+
+    参数：
+        outputs: 包含 logits 的模型输出
+        labels: Labels 张量 [batch_size, seq_len]
+        loss_scale: Loss scale 张量 [batch_size, seq_len]
+        num_items_in_batch: 用于归一化的非 -100 token 数量
+        trainer: Trainer 实例，用于访问 tokenizer
+
+    返回：
+        total_loss = token_loss + alpha * classification_loss
+    """
+    import os
+
+    if trainer is None:
+        raise ValueError('trainer is required for category_weighted_loss_with_aux_classification')
+
+    tokenizer = trainer.processing_class
+
+    # 读取配置
+    alpha = float(os.environ.get('AUX_CLASSIFICATION_ALPHA', '0.5'))
+    category_weights = {
+        '曝光': float(os.environ.get('CATEGORY_WEIGHT_曝光', '1.0')),
+        '领取': float(os.environ.get('CATEGORY_WEIGHT_领取', '10.0')),
+        '核销': float(os.environ.get('CATEGORY_WEIGHT_核销', '100.0')),
+    }
+
+    # ========== 1. 计算 token 级别 loss（已包含 sample-level weight）==========
+    token_loss = category_weighted_loss_func(outputs, labels, loss_scale, num_items_in_batch, trainer, **kwargs)
+
+    # ========== 2. 提取预测类别和真实类别 ==========
+    if loss_scale is None:
+        # 没有 loss_scale，无法进行分类
+        return token_loss
+
+    batch_size = labels.shape[0]
+    logits = outputs.logits
+
+    # 获取预测的 token IDs（argmax）
+    pred_token_ids = torch.argmax(logits, dim=-1)  # [batch_size, seq_len]
+
+    true_categories = []
+    pred_categories = []
+    sample_weights = []
+    cate_debugs = []
+    pred_dicts = []
+
+    # 处理 loss_scale 形状
+    if loss_scale.dim() == 1:
+        loss_scale_2d = loss_scale.view(batch_size, -1)
+    elif loss_scale.dim() == 2:
+        loss_scale_2d = loss_scale
+    else:
+        loss_scale_2d = loss_scale.view(batch_size, -1)
+
+    for i in range(batch_size):
+        # 提取真实类别（从 loss_scale）
+        sample_loss_scale = loss_scale_2d[i]
+        sample_loss_scale_rolled = torch.roll(sample_loss_scale, shifts=-1, dims=0)
+        true_cat, cate_debug_dict = detect_category_from_loss_scale(sample_loss_scale_rolled)
+        cate_debugs.append(cate_debug_dict)
+
+        # 提取预测类别（从 pred_token_ids）
+        # 只使用有效的 token（labels != -100）
+        sample_labels = labels[i]
+        valid_mask = sample_labels != -100
+        valid_pred_tokens = pred_token_ids[i][valid_mask]
+        pred_cat, pred_dict = extract_category_from_tokens(valid_pred_tokens, tokenizer)
+        pred_dicts.append(pred_dict)
+
+        true_categories.append(true_cat)
+        pred_categories.append(pred_cat)
+
+        # 获取 sample weight
+        if true_cat in category_weights:
+            sample_weights.append(category_weights[true_cat])
+        else:
+            sample_weights.append(1.0)
+
+    # ========== 3. 计算分类 loss ==========
+    classification_losses = []
+    correct_count = 0
+    total_count = 0
+
+    for i in range(batch_size):
+        true_cat = true_categories[i]
+        pred_cat = pred_categories[i]
+
+        if true_cat is None or pred_cat is None:
+            # 提取失败，跳过
+            continue
+
+        total_count += 1
+
+        # 简化的 0/1 loss
+        if pred_cat == true_cat:
+            loss_value = 0.0
+            correct_count += 1
+        else:
+            loss_value = 1.0
+
+        # 应用 sample-level weight
+        weighted_loss = loss_value * sample_weights[i]
+        classification_losses.append(weighted_loss)
+
+    # 聚合分类 loss
+    if len(classification_losses) > 0:
+        classification_loss = sum(classification_losses) / len(classification_losses)
+        classification_loss = torch.tensor(classification_loss, device=token_loss.device, dtype=token_loss.dtype)
+    else:
+        classification_loss = torch.tensor(0.0, device=token_loss.device, dtype=token_loss.dtype)
+
+    # ========== 4. 组合 loss ==========
+    total_loss = token_loss + alpha * classification_loss
+
+    # ========== 5. 记录到 swanlab ==========
+    if should_log_to_swanlab():
+        with torch.no_grad():
+            swanlab.log({
+                'loss/token_loss': to_scalar(token_loss),
+                'loss/classification_loss': to_scalar(classification_loss),
+                'loss/total_loss': to_scalar(total_loss),
+                'loss/alpha': alpha,
+                'category/correct_count': correct_count,
+                'category/total_count': total_count,
+                'category/accuracy': correct_count / total_count if total_count > 0 else 0.0,
+            })
+
+    # ========== 6. 保存 debug 信息 ==========
+    try:
+        debug_info = {
+            'true_categories': true_categories,
+            'pred_categories': pred_categories,
+            'token_loss': to_scalar(token_loss),
+            'classification_loss': to_scalar(classification_loss),
+            'total_loss': to_scalar(total_loss),
+            'sample_weights': sample_weights,
+            'correct_count': correct_count,
+            'total_count': total_count,
+            'pred_dicts': pred_dicts,
+            'cate_debugs': cate_debugs,
+        }
+
+        with open('/tmp/aux_classification_debug.jsonl', 'a') as f:
+            f.write(json.dumps(debug_info, ensure_ascii=False) + '\n')
+    except Exception as e:
+        pass  # 忽略 debug 文件写入错误
+
+    return total_loss
+
+##################
+
 loss_mapping = {
     'cross_entropy': cross_entropy_loss_func,  # examples
     # embedding
@@ -819,7 +2734,22 @@ loss_mapping = {
     'generative_reranker': generative_reranker_loss,
     'listwise_reranker': listwise_reranker_loss,
     'listwise_generative_reranker': listwise_generative_reranker_loss,
+    # seq-cls + listwise
+    'seqcls_plus_listwise_rank': seqcls_plus_listwise_rank_loss,
+    # seq-cls + pairwise
+    'seqcls_plus_pairwise_rank': seqcls_plus_pairwise_rank_loss,
+    'seqcls_plus_pairwise_rank_loss_threshold': seqcls_plus_pairwise_rank_loss_threshold,
+    'pricing_pairwise_loss': pricing_pairwise_loss,
+    'pricing_listwise_loss': pricing_listwise_loss,
+    'bank_rank_listwise_loss': bank_rank_listwise_loss,
+    'pricing_listmle_loss': pricing_listmle_loss,
+    'pricing_focal_loss': pricing_focal_loss,
+    'scale_loss_func': scale_loss_func,
+    'scale_cross_entropy_loss_func': scale_cross_entropy_loss_func,
+    'category_weighted': category_weighted_loss_func,
+    'category_weighted_aux': category_weighted_loss_with_aux_classification,  # 辅助分类Loss
 }
+
 
 
 def get_loss_func(loss_type: Optional[str]) -> Optional[Callable]:

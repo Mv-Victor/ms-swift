@@ -38,20 +38,33 @@ def calculate_loss_scale(query: str,
     if delimiters:
         agent_parts = split_str_parts_by(response, delimiters)
     else:
-        regex_delimiters = [k for k, v in response_loss_scale_map.items() if len(v) == 1]
+        regex_delimiters = [k for k, v in response_loss_scale_map.items() if len(v) in {1, 3}]
         agent_parts = split_str_parts_by(response, regex_delimiters, regex_mode=True)
     weights = []
     agent_content = []
     for c in agent_parts:
         if c['key'] in response_loss_scale_map:
             loss_scale = response_loss_scale_map[c['key']]
-            assert len(loss_scale) in {1, 2}, f'loss_scale: {loss_scale}'
+            assert len(loss_scale) in {1, 2, 3}, f'loss_scale: {loss_scale}'
             if len(loss_scale) == 1:
+                # Old format: apply single weight to entire match
                 weights += loss_scale
                 agent_content.append(c['content'])
-            else:
+            elif len(loss_scale) == 2:
+                # Two-element format: delimiter and content
                 weights += loss_scale
                 agent_content += [c['key'], c['content']]
+            elif len(loss_scale) == 3:
+                # New format: [start_tag_weight, content_weight, end_tag_weight]
+                if c.get('has_groups', False):
+                    # Has capture groups: separate tags and content
+                    start_tag_weight, content_weight, end_tag_weight = loss_scale
+                    weights += [start_tag_weight, content_weight, end_tag_weight]
+                    agent_content += [c['start_tag'], c['inner_content'], c['end_tag']]
+                else:
+                    # No capture groups: apply first weight to entire match (backward compatibility)
+                    weights.append(loss_scale[0])
+                    agent_content.append(c['content'])
         else:
             weights.append(1.)
             agent_content.append(c['content'])
